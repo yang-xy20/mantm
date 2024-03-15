@@ -1,0 +1,15 @@
+[submodule "onpolicy/envs/iGibson"]
+	path = onpolicy/envs/iGibson
+	url = https://github.com/zoeyuchao/iGibson.git
+[submodule "onpolicy/envs/MultiVehicleEnv"]
+	path = onpolicy/envs/MultiVehicleEnv
+	url = https://github.com/efc-robot/MultiVehicleEnv.git
+[submodule "onpolicy/envs/habitat/habitat-lab"]
+	path = onpolicy/envs/habitat/habitat-lab
+	url = https://github.com/yang-xy20/habitat-lab.git
+[submodule "onpolicy/envs/habitat/habitat-sim"]
+	path = onpolicy/envs/habitat/habitat-sim
+	url = https://github.com/yang-xy20/habitat-sim.git
+[submodule "onpolicy/envs/football/football"]
+	path = onpolicy/envs/football/football
+	url = https://github.com/zelaix/football.git

@@ -57,6 +57,7 @@ class GraphHabitatEnv(MultiHabitatEnv):
         self.use_frontier_nodes = args.use_frontier_nodes
         self.max_frontier = args.max_frontier
         self.use_double_matching = args.use_double_matching
+        self.use_single = args.use_single
         map_size = args.map_size_cm // args.map_resolution
         full_w, full_h = map_size, map_size
         self.local_w, self.local_h = int(full_w / args.global_downscaling), \
@@ -279,212 +280,6 @@ class GraphHabitatEnv(MultiHabitatEnv):
                         self.merge_graph.add_ghost_node(b, labels[b], world_ghost_position[b], self.imgs, self.positions, raw_img)
                 self.merge_graph.num_init_nodes = len(self.merge_graph.node_position_list)
 
-        # close = self.is_close(self.graph.last_localized_node_embedding, new_embedding, return_prob=False)#if two embedding is similar
-        # found = done_list + np.array(close) # (T,T): is in 0 state, (T,F): not much moved, (F,T): impossible, (F,F): moved much
-        # found_batch_indices = np.where(found)[0] 
-        # localized_node_indices = np.ones([self.num_agents], dtype=np.int32) * -1
-        # localized_node_indices[found_batch_indices] = self.graph.last_localized_node_idx[found_batch_indices]
-        # if self.all_args.update_nodes:
-        #     self.graph.update_nodes(found_batch_indices, localized_node_indices[found_batch_indices], time[found_batch_indices])
-
-        # check_list = 1 - self.graph.graph_mask[:, :self.graph.num_node_max()]
-        # check_list[range(self.num_agents), self.graph.last_localized_node_idx.astype(np.compat.long)] = 1.0
-        # check_list[found_batch_indices] = 1.0
-        # to_add = np.zeros(self.num_agents)
-        # hop = 1
-        # max_hop = 0
-        # while not found.all():
-        #     if hop <= max_hop : k_hop_A = self.graph.calculate_multihop(hop)
-        #     not_found_batch_indicies = np.where(~found)[0]
-        #     neighbor_embedding = []
-        #     batch_new_embedding = []
-        #     num_neighbors = []
-            
-        #     neighbor_indices = []
-        #     for b in not_found_batch_indicies:
-        #         if hop <= max_hop:
-        #             neighbor_mask = k_hop_A[b,self.graph.last_localized_node_idx[b]] == 1
-        #             not_checked_yet = np.where((1 - check_list[b]) * neighbor_mask[:len(check_list[b])])[0]
-        #         else:
-        #             not_checked_yet = np.where((1-check_list[b]))[0]
-        
-        #         neighbor_indices.append(not_checked_yet)
-        #         neighbor_embedding.append(self.graph.graph_memory[b, not_checked_yet])
-        #         num_neighbors.append(len(not_checked_yet))
-        #         if len(not_checked_yet) > 0:
-        #             batch_new_embedding.append(new_embedding[b:b+1].repeat(len(not_checked_yet),1))
-        #         else:
-        #             found[b] = True
-        #             to_add[b] = True
-        #     if np.sum(np.array(num_neighbors)) > 0:
-        #         neighbor_embedding = np.concatenate(neighbor_embedding)
-        #         batch_new_embedding = np.concatenate(batch_new_embedding)
-        #         batch_close, batch_prob = self.is_close(neighbor_embedding, batch_new_embedding, return_prob=True)
-        #         close = torch.tensor(batch_close).split(num_neighbors)
-        #         prob = torch.tensor(batch_prob).split(num_neighbors)
-        #         for ii in range(len(close)):
-        #             is_close = np.where(close[ii] == True)[0]
-        #             if len(is_close) == 1:
-        #                 b = not_found_batch_indicies[ii]
-        #                 last_idx = self.graph.last_localized_node_idx[b]
-        #                 found_node_index = neighbor_indices[ii][is_close.item()]
-        #                 if pu.get_l2_distance(self.graph.node_position_list[b][found_node_index][0], self.graph.node_position_list[b][last_idx][0], \
-        #                         self.graph.node_position_list[b][found_node_index][1], self.graph.node_position_list[b][last_idx][1]) > 2.5:
-        #                     found_node = None 
-        #                 else:
-        #                     found_node = found_node_index
-                        
-        #             elif len(is_close) > 1:
-        #                 b = not_found_batch_indicies[ii]
-        #                 last_idx = self.graph.last_localized_node_idx[b]
-        #                 for _ in range(len(prob[ii])):
-        #                     found_node_index = neighbor_indices[ii][prob[ii].argmax().item()]                                
-        #                     if pu.get_l2_distance(self.graph.node_position_list[b][found_node_index][0], self.graph.node_position_list[b][last_idx][0], \
-        #                         self.graph.node_position_list[b][found_node_index][1], self.graph.node_position_list[b][last_idx][1]) > 2.5:
-        #                         found_node = None 
-        #                     else:
-        #                         found_node = found_node_index
-        #                         break
-        #                     prob[ii][prob[ii].argmax().item()] = 0
-        #             else:
-        #                 found_node = None
-        #             b = not_found_batch_indicies[ii]
-        #             if found_node is not None:
-        #                 found[b] = True
-        #                 localized_node_indices[b] = found_node
-        #                 if found_node != self.graph.last_localized_node_idx[b]:
-        #                     if self.all_args.update_nodes:
-        #                         self.graph.update_node(b, found_node, time[b], new_embedding[b])
-        #                     self.graph.add_edge(b, found_node, self.graph.last_localized_node_idx[b])
-        #                     self.graph.record_localized_state(b, found_node, new_embedding[b])
-        #             check_list[b, neighbor_indices[ii]] = 1.0
-        #     hop += 1
-
-        # batch_indices_to_add_new_node = np.where(to_add)[0]
-        # for b in batch_indices_to_add_new_node:
-        #     new_node_idx = self.graph.num_node(b)
-        #     self.graph.add_node(b, new_node_idx, new_embedding[b], time[b], position[b])
-        #     self.graph.add_edge(b, new_node_idx, self.graph.last_localized_node_idx[b])
-        #     self.graph.record_localized_state(b, new_node_idx, new_embedding[b])
-            
-        # for agent_id in range(self.num_agents):
-        #     (start_x, start_y, start_o)  =  self.env.world_transform(agent_id, self.env.curr_loc[agent_id])
-        #     start_pos = (start_x, start_y, start_o)
-        #     if np.array(time).sum() == self.num_agents:
-        #         for other_agent_id in range(self.num_agents):
-        #             if other_agent_id!=agent_id:
-        #                 merge_close, prob = self.is_close(np.expand_dims(self.merge_graph.last_localized_node_embedding[other_agent_id],0), new_embedding[agent_id:agent_id+1], return_prob=True)
-        #                 merge_found = done_list[agent_id] + np.array(merge_close)
-        #                 if merge_found.all() :
-        #                     if self.merge_graph.graph_mask[1] == 1:
-        #                         start_other_pos  =  self.env.world_transform(other_agent_id, self.env.curr_loc[other_agent_id])
-        #                         #dis = self.env.get_fmm_distance(start_other_pos, start_pos)
-        #                         dis = 1
-        #                         self.merge_graph.add_edge(agent_id, other_agent_id, dis)
-        #         break
-        #     else:
-        #         merge_close = self.is_close(np.expand_dims(self.merge_graph.last_localized_node_embedding[agent_id],0), new_embedding[agent_id:agent_id+1], return_prob=False)
-        #     #if two embedding is similar
-            
-        #     merge_found = done_list[agent_id] + np.array(merge_close) # (T,T): is in 0 state, (T,F): not much moved, (F,T): impossible, (F,F): moved much
-            
-        #     (last_x, last_y, last_o) = self.merge_graph.get_positions(self.merge_graph.last_localized_node_idx[agent_id])
-        #     last_pos = (last_x, last_y, last_o)
-        #     if merge_found.all():
-        #         if not self.use_restrict_graph :                
-        #             localized_node_indices = self.merge_graph.last_localized_node_idx[agent_id]
-        #             if self.all_args.update_nodes:
-        #                 self.merge_graph.update_nodes(localized_node_indices, agent_id, time[agent_id], new_embedding[agent_id])
-        #         elif pu.get_l2_distance(last_x, start_x, last_y, start_y) < self.dis_gap:
-        #             localized_node_indices = self.merge_graph.last_localized_node_idx[agent_id]
-        #             if self.all_args.update_nodes:
-        #                 self.merge_graph.update_nodes(localized_node_indices, agent_id, time[agent_id], new_embedding[agent_id])
-        #         else:
-        #             merge_found = np.array([False])
-        #     else:
-        #         merge_found = np.array([False])
-
-        #     check_list = 1 - self.merge_graph.graph_mask[ :self.merge_graph.num_node_max()]
-        #     check_list[self.merge_graph.last_localized_node_idx[agent_id]] = 1.0
-        #     if merge_found.all():
-        #         check_list[:] = 1.0
-        #     to_add = 0
-        #     hop = 1
-        #     max_hop = 0
-        #     while not merge_found.all():
-        #         if hop <= max_hop : k_hop_A = self.merge_graph.calculate_multihop(hop)
-        #         neighbor_embedding = []
-        #         batch_new_embedding = []
-        #         num_neighbors = []
-        #         neighbor_indices = []
-        #         if hop <= max_hop:
-        #             neighbor_mask = k_hop_A[agent_id,self.merge_graph.last_localized_node_idx[agent_id]] == 1
-        #             not_checked_yet = np.where((1 - check_list) * neighbor_mask[:len(check_list[agent_id])])[0]
-        #         else:
-        #             not_checked_yet = np.where((1-check_list))[0]
-        #         neighbor_indices.append(not_checked_yet)
-        #         neighbor_embedding.append(self.merge_graph.graph_memory[not_checked_yet])
-        #         num_neighbors.append(len(not_checked_yet))
-        #         if len(not_checked_yet) > 0:
-        #             batch_new_embedding.append(new_embedding[agent_id:agent_id+1].repeat(len(not_checked_yet),1))
-        #         else:
-        #             merge_found = np.array([True])
-        #             to_add = True
-        #         if np.sum(np.array(num_neighbors)) > 0:
-        #             neighbor_embedding = np.concatenate(neighbor_embedding)
-        #             batch_new_embedding = np.concatenate(batch_new_embedding)
-        #             batch_close, batch_prob = self.is_close(neighbor_embedding, batch_new_embedding, return_prob=True)
-        #             close = torch.tensor(batch_close).split(num_neighbors)
-        #             prob = torch.tensor(batch_prob).split(num_neighbors)
-        #             for ii in range(len(close)):
-        #                 is_close = np.where(close[ii] == True)[0]
-        #                 if len(is_close) == 1:
-        #                     found_node_index = neighbor_indices[ii][is_close.item()]
-        #                     if pu.get_l2_distance(self.merge_graph.node_position_list[found_node_index][0], start_x, \
-        #                             self.merge_graph.node_position_list[found_node_index][1], start_y) > self.dis_gap:
-        #                         found_node = None 
-        #                     else:
-        #                         found_node = found_node_index
-                            
-        #                 elif len(is_close) > 1:
-        #                     for _ in range(len(prob[ii])):
-        #                         found_node_index = neighbor_indices[ii][prob[ii].argmax().item()]                                
-        #                         if pu.get_l2_distance(self.merge_graph.node_position_list[found_node_index][0], start_x, \
-        #                             self.merge_graph.node_position_list[found_node_index][1], start_y) > self.dis_gap:
-        #                             found_node = None 
-        #                         else:
-        #                             found_node = found_node_index
-        #                             break
-        #                         prob[ii][prob[ii].argmax().item()] = 0
-        #                 else:
-        #                     found_node = None
-        #                 if found_node is not None:
-        #                     merge_found = np.array([True])
-        #                     localized_node_indices = found_node
-        #                     if found_node != self.merge_graph.last_localized_node_idx[agent_id]:
-        #                         if self.all_args.update_nodes:
-        #                             self.merge_graph.update_node(found_node, agent_id, time[agent_id], new_embedding[agent_id])
-        #                         #found_pos = self.merge_graph.get_positions(found_node)
-        #                         #dis = self.env.get_fmm_distance(found_pos, last_pos)
-        #                         dis = 0
-        #                         self.merge_graph.add_edge(found_node, self.merge_graph.last_localized_node_idx[agent_id], dis)
-        #                         self.merge_graph.record_localized_state(found_node, agent_id, new_embedding[agent_id])
-        #                 check_list[neighbor_indices[ii]] = 1.0
-        #         hop += 1
-        #     if to_add:
-        #         new_node_idx = self.merge_graph.num_node()
-        #         _, is_near = self.merge_graph.if_nearby(self.merge_graph.node_position_list, world_position[agent_id])
-        #         if not is_near or not self.all_args.use_sparse_graph:
-        #             self.merge_graph.add_node(new_node_idx, agent_id, new_embedding[agent_id], time[agent_id], world_position[agent_id])
-        #             #found_pos = self.merge_graph.get_positions(new_node_idx)
-        #             #dis = self.env.get_fmm_distance(found_pos, last_pos)
-        #             dis = 0
-        #             self.merge_graph.add_edge(new_node_idx, self.merge_graph.last_localized_node_idx[agent_id], dis)
-        #             self.merge_graph.record_localized_state( new_node_idx, agent_id, new_embedding[agent_id])
-        #             if self.add_ghost:
-        #                 #self.merge_graph.ghost_check(world_position[agent_id])
-        #                 self.merge_graph.add_ghost_node(agent_id, labels[agent_id], world_ghost_position[agent_id], self.imgs, self.positions, raw_img)
-
     def single_localize(self, new_embedding, position, world_position, time, labels, ghost_position, world_ghost_position, done_list, raw_img=None, add_node=False):
         # The position is only used for visualizations.
         time = np.array(time)[:,0]
@@ -687,24 +482,6 @@ class GraphHabitatEnv(MultiHabitatEnv):
 
     def get_graph_waypoint(self, global_goal):
         goal = np.zeros((self.num_agents, 2), np.int32)
-        # output = [np.zeros((2)) for _ in range(self.num_agents)]
-        # def discretize(dist):
-        #     dist_limits = [0.25, 3, 10]
-        #     dist_bin_size = [0.05, 0.25, 1.]
-        #     if dist < dist_limits[0]:
-        #         ddist = int(dist/dist_bin_size[0])
-        #     elif dist < dist_limits[1]:
-        #         ddist = int((dist - dist_limits[0])/dist_bin_size[1]) + \
-        #             int(dist_limits[0]/dist_bin_size[0])
-        #     elif dist < dist_limits[2]:
-        #         ddist = int((dist - dist_limits[1])/dist_bin_size[2]) + \
-        #             int(dist_limits[0]/dist_bin_size[0]) + \
-        #             int((dist_limits[1] - dist_limits[0])/dist_bin_size[1])
-        #     else:
-        #         ddist = int(dist_limits[0]/dist_bin_size[0]) + \
-        #             int((dist_limits[1] - dist_limits[0])/dist_bin_size[1]) + \
-        #             int((dist_limits[2] - dist_limits[1])/dist_bin_size[2])
-        #     return ddist
         
         for agent_id in range(self.num_agents):
             (goal_x, goal_y, goal_o) = self.merge_graph.get_positions(int(global_goal[agent_id]))
@@ -730,30 +507,6 @@ class GraphHabitatEnv(MultiHabitatEnv):
             
             goal[agent_id] = [int(next_x * 100.0/self.map_resolution),
                         int(next_y * 100.0/self.map_resolution)]
-            # r, c = next_y, next_x
-            # next = [int(r * 100.0/self.map_resolution),
-            #         int(c * 100.0/self.map_resolution)]
-            # next = pu.threshold_poses(next, self.map_shape)    
-    
-            # r, c = start_y, start_x
-            # start = [int(r * 100.0/self.map_resolution),
-            #          int(c * 100.0/self.map_resolution)]
-            # start = pu.threshold_poses(start, self.map_shape)           
-            
-            # relative_dist = pu.get_l2_distance(next[0], start[0], next[1], start[1])
-            # relative_dist = relative_dist*5./100.
-            # angle_st_goal = math.degrees(math.atan2(next[0] - start[0],
-            #                                         next[1] - start[1]))
-            # angle_agent = (start_o) % 360.0
-            # if angle_agent > 180:
-            #     angle_agent -= 360
-
-            # relative_angle = (angle_agent - angle_st_goal) % 360.0
-            # if relative_angle > 180:
-            #     relative_angle -= 360
-
-            # output[agent_id][0] = int((relative_angle % 360.)/5.)
-            # output[agent_id][1] = discretize(relative_dist)
         return goal, self.has_node
     
     def node_max_num(self):
@@ -812,10 +565,7 @@ class GraphHabitatEnv(MultiHabitatEnv):
     def get_goal_position(self, global_goal):
         self.valid_ghost_position = np.zeros((1000,3), np.float)
         self.valid_ghost_single_position = None
-        if self.use_several_nodes:
-            goal = np.zeros((self.num_agents, 2, 2), np.int32)
-        else:
-            goal = np.zeros((self.num_agents, 1, 2), np.int32)
+        goal = np.zeros((self.num_agents, 1, 2), np.int32)
         for agent_id in range(self.num_agents):
             for i in range(goal.shape[1]):
                 (goal_x, goal_y, goal_o) = self.merge_graph.get_ghost_positions(int(global_goal[agent_id][i]), agent_id)

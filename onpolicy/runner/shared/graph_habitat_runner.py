@@ -32,6 +32,8 @@ from torch_geometric.data import Data
 from onpolicy.envs.habitat.utils import pose as pu
 import tsp
 from sklearn.cluster import KMeans
+from onpolicy.envs.habitat.utils.mtsp import compute_kmeans, compute_frontier_plan
+
 
 def _t2n(x):
     return x.detach().cpu().numpy()
@@ -60,310 +62,7 @@ class GraphHabitatRunner(Runner):
         # slam module
         self.init_slam_module()    
     
-    def warmup(self):
-        # reset env
-        self.obs, env_infos = self.envs.reset()
-        add_infos = self.embed_obs(env_infos)
-        infos = self.envs.update_merge_graph(add_infos)
-        self.trans = [infos[e]['trans'] for e in range(self.n_rollout_threads)]
-        self.rotation = [infos[e]['rotation'] for e in range(self.n_rollout_threads)]
-        self.scene_id = [infos[e]['scene_id'] for e in range(self.n_rollout_threads)]
-        self.agent_trans = [infos[e]['agent_trans'] for e in range(self.n_rollout_threads)]
-        self.agent_rotation = [infos[e]['agent_rotation'] for e in range(self.n_rollout_threads)]
-        self.explorable_map = np.array([infos[e]['explorable_map'] for e in range(self.n_rollout_threads)])
-        self.sim_map_size = [infos[e]['sim_map_size'] for e in range(self.n_rollout_threads)]
-        self.agent_cur_loc = np.array([infos[e]['world_position'] for e in range(self.n_rollout_threads)])
-        self.first_compute_in_run = [True for _ in range(self.n_rollout_threads)]
-        self.global_step = np.array([0 for _ in range(self.n_rollout_threads)])
-        self.goal = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.int32)
-        self.global_goal_position = np.zeros((self.n_rollout_threads, self.num_agents, 2), dtype=np.int32)
-       
-        # Predict map from frame 1:
-        self.run_slam_module(self.obs, self.obs, infos)
-
-        # Compute Global policy input  
-        self.first_compute = True 
-        if self.learn_to_build_graph or self.use_frontier_nodes:
-            self.compute_graph_input(infos, self.first_compute_in_run, self.global_step)
-            if not self.use_centralized_V:
-                self.share_global_input = self.global_input.copy()
-
-            # replay buffer
-            for key in self.global_input.keys():
-                self.buffer.obs[key][0] = self.global_input[key].copy()
-            for key in self.share_global_input.keys():
-                self.buffer.share_obs[key][0] = self.share_global_input[key].copy()
-
-            values, actions, action_log_probs, rnn_states, rnn_states_critic = self.compute_global_goal(step=0)
-            if self.use_ft_frontiers:
-                frontiers_temp = self.global_input['graph_ghost_node_position'][:,0].copy()
-                frontiers_temp = frontiers_temp[:,:,[1,0]]*self.full_w
-                if len(frontiers_temp.shape) == 2:
-                    frontiers_temp = np.expand_dims(frontiers_temp, axis=0)
-                render_inp = np.concatenate([frontiers_temp, self.global_goal_position[:,:,[1,0]]], axis=1)
-                self.envs.store_goal(render_inp)
-        # compute local input
-        for a in range(self.num_agents):
-            if self.use_local_single_map:
-                self.single_merge_map[:, a] = self.single_transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
-            else:
-                self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)   
-        self.first_compute = False
-        if self.use_frontier_nodes:
-            for e in range(self.n_rollout_threads):
-                for agent_id in range(self.num_agents):
-                    self.global_goal_position[e,agent_id,0] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],1]
-                    self.global_goal_position[e,agent_id,1] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],0]
-        
-        if self.learn_to_build_graph:
-            node_max_num = self.envs.node_max_num()
-            node_idx = []
-            for e in range(self.n_rollout_threads):
-                if self.use_mgnn:
-                    self.goal[e] = self.global_goal[e]
-                else:
-                    node_idx.append(self.global_goal[e] * node_max_num[e])
-            if not self.use_mgnn:
-                self.goal = self.envs.get_valid_num(node_idx)
-            if self.use_frontier:
-                self.goal = self.envs.get_graph_frontier()
-            if self.use_global_goal:
-                self.global_goal_position, self.valid_ghost_position,_ = self.envs.get_goal_position(self.goal)
-                self.global_goal_position = self.global_goal_position[:,:,0]
-            else:
-                self.global_goal_position, self.has_node = self.envs.get_graph_waypoint(self.goal)
-            self.add_ghost_flag = np.ones((self.valid_ghost_position.shape[0],self.valid_ghost_position.shape[1]))*False
-        if self.use_local_single_map:
-            self.compute_local_input(self.single_merge_map)
-        else:
-            self.compute_local_input(self.merge_map)
-        self.global_output = self.envs.get_short_term_goal(self.global_insert)
-        self.global_output = np.array(self.global_output, dtype = np.compat.long)
-        
-        self.last_obs = copy.deepcopy(self.obs)
-            
-        return values, actions, action_log_probs, rnn_states, rnn_states_critic
-    
-    def run(self):
-        # map and pose
-        self.init_map_and_pose()
-        self.env_step = 0
-
-        values, actions, action_log_probs, rnn_states, rnn_states_critic = self.warmup()   
-        start = time.time()
-        episodes = int(self.num_env_steps) // self.max_episode_length // self.n_rollout_threads
-        self.init_env_info()
-        self.add_node = np.ones((self.n_rollout_threads,self.num_agents))*False
-        self.add_node_flag = np.ones((self.n_rollout_threads,self.num_agents))*False
-        self.global_step = np.array([0 for _ in range(self.n_rollout_threads)])
-        for episode in range(episodes):
-            self.init_env_infos()
-            
-            for step in range(self.max_episode_length):
-                if (step+1) % 15  == 0:
-                    print("step", step+1)
-                self.env_step = step
-                local_step = step % self.num_local_steps
-                env_global_step = (step // self.num_local_steps) % self.episode_length
-    
-                del self.last_obs
-                self.last_obs = copy.deepcopy(self.obs)
-                
-                # Sample actions
-                if self.learn_to_build_graph or self.use_frontier_nodes:
-                    self.actions_env = self.compute_local_action()
-                # Obser reward and next obs
-                else:
-                    self.actions_env = np.copy(actions[:,:,local_step:local_step+1].reshape(self.n_rollout_threads, self.num_agents))    
-                self.obs, _, dones, env_infos = self.envs.step(self.actions_env)
-                self.agent_cur_loc = np.array([env_infos[e]['world_position'] for e in range(self.n_rollout_threads)])
-                for e in range(self.n_rollout_threads):
-                    for agent_id in range(self.num_agents):
-                        if self.add_ghost:
-                            for pos in range(self.valid_ghost_position.shape[1]):
-                                if self.valid_ghost_position[e,pos].sum() == 0:
-                                    pass
-                                else:
-                                    if pu.get_l2_distance(self.agent_cur_loc[e,agent_id,0] ,self.valid_ghost_position[e, pos,0]*5/100,\
-                                    self.agent_cur_loc[e,agent_id,1], self.valid_ghost_position[e, pos,1]*5/100) < 0.5 and \
-                                    self.add_ghost_flag[e, pos] == False:
-                                        self.add_node[e][agent_id] = True
-                                        self.add_ghost_flag[e, pos] = True
-                            
-                add_infos = self.embed_obs(env_infos)
-                for e in range(self.n_rollout_threads):
-                    if local_step == self.num_local_steps - 1:
-                        add_infos[e]['update'] = True
-                    else:
-                        add_infos[e]['update'] = False
-                    add_infos[e]['add_node'] = self.add_node[e]
-    
-                infos, reward = self.envs.update_merge_step_graph(add_infos)
-                self.add_node = np.ones((self.n_rollout_threads,self.num_agents))*False
-                self.rewards += reward
-                
-                for e in range (self.n_rollout_threads):
-                    for key in self.sum_env_info_keys:
-                        if key in infos[e].keys():
-                            self.env_info['sum_{}'.format(key)][e] += np.array(infos[e][key])
-                    for key in self.equal_env_info_keys:
-                        if key == 'explored_ratio_step':
-                            for agent_id in range(self.num_agents):
-                                agent_k = "agent{}_{}".format(agent_id, key)
-                                if agent_k in infos[e].keys():
-                                    self.env_info[key][e][agent_id] = infos[e][agent_k]
-                        else:
-                            if key in infos[e].keys():
-                                self.env_info[key][e] = infos[e][key]
-                    if self.num_agents==1:
-                        if step in [49, 99, 149, 199, 249, 299, 349, 399, 449]:
-                            self.env_info[str(step+1)+'step_merge_overlap_ratio'][e] = infos[e]['overlap_ratio']
-                    else:
-                        if step in [49, 99, 119, 149, 179, 199, 249, 299]:
-                            self.env_info[str(step+1)+'step_merge_overlap_ratio'][e] = infos[e]['overlap_ratio'] 
-                    
-                self.local_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-                self.local_masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
-                self.global_masks *= self.local_masks
-                # Neural SLAM Module
-                if self.train_slam:
-                    self.insert_slam_module(infos)
-               
-                self.run_slam_module(self.last_obs, self.obs, infos, True)
-
-                if self.use_ft_frontiers:
-                    self.ft_go_steps += 1
-
-                self.update_local_map()
-                self.update_map_and_pose(False)
-                if self.add_ghost or self.use_frontier_nodes:
-                    for a in range(self.num_agents):
-                        if self.use_local_single_map:
-                            self.single_merge_map[:, a] = self.single_transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
-                        else:
-                            self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)   
-              
-                if self.use_ft_frontiers:
-                    for e in range(self.n_rollout_threads):
-                        self.compute_frontiers_ft(e)
-                        infos[e]['frontier_loc'] = []
-                        for agent in range(self.num_agents):
-                            infos[e]['frontier_loc'] += self.ft_training[e][agent]
-                        infos[e]['frontier_loc'] = self.ft_pooling(infos[e]['frontier_loc'])
-                # Global Policy
-                if local_step == self.num_local_steps - 1:
-                    self.reset_env_info(dones, infos)
-                    # For every global step, update the full and local maps
-                    self.add_node_flag = np.ones((self.n_rollout_threads,self.num_agents))*False
-                    self.update_map_and_pose()
-                    if self.learn_to_build_graph or self.use_frontier_nodes:
-                        self.compute_graph_input(infos, self.first_compute_in_run, self.global_step+1)
-                        data = dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
-                        # insert data into buffer
-                       
-                        self.insert_global_policy(data)
-                        
-                        values, actions, action_log_probs, rnn_states, rnn_states_critic = self.compute_global_goal(env_global_step + 1)
-                        if self.use_ft_frontiers:
-                            frontiers_temp = self.global_input['graph_ghost_node_position'][:,0].copy()
-                            frontiers_temp = frontiers_temp[:,:,[1,0]]*self.full_w
-                            if len(frontiers_temp.shape) == 2:
-                                frontiers_temp = np.expand_dims(frontiers_temp, axis=0)
-
-                            render_inp = np.concatenate([frontiers_temp, self.global_goal_position[:,:,[1,0]]], axis=1)
-                            self.envs.store_goal(render_inp)
-                    
-                    if self.add_ghost:
-                        node_max_num = self.envs.node_max_num()
-                        node_idx = []
-                        for e in range(self.n_rollout_threads):
-                            if self.use_mgnn:
-                                self.goal[e] = self.global_goal[e]      
-                            else:
-                                node_idx.append(self.global_goal[e] * node_max_num[e])
-                        if not self.use_mgnn:
-                            self.goal = self.envs.get_valid_num(node_idx)
-                        if self.use_frontier:
-                            self.goal = self.envs.get_graph_frontier()
-                    if self.use_frontier_nodes:
-                        for e in range(self.n_rollout_threads):
-                            for agent_id in range(self.num_agents):
-                                self.global_goal_position[e,agent_id,0] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],1]
-                                self.global_goal_position[e,agent_id,1] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],0]
-                    
-                    if self.learn_to_build_graph:
-                        if self.use_global_goal:
-                            
-                            self.global_goal_position, self.valid_ghost_position,_ = self.envs.get_goal_position(self.goal)
-                            self.global_goal_position = self.global_goal_position[:,:,0]
-                        else:
-                            self.global_goal_position, self.has_node = self.envs.get_graph_waypoint(self.goal)
-                        self.add_ghost_flag = np.ones((self.valid_ghost_position.shape[0],self.valid_ghost_position.shape[1]))*False
-                    
-                    self.global_step += 1
-                    
-                # Local Policy
-                
-                if self.add_ghost or self.use_frontier_nodes:
-                    if self.use_local_single_map:
-                        self.compute_local_input(self.single_merge_map)
-                    else:
-                        self.compute_local_input(self.merge_map)
-                    # Output stores local goals as well as the the ground-truth action
-                    self.global_output = self.envs.get_short_term_goal(self.global_insert)
-                    self.global_output = np.array(self.global_output, dtype = np.compat.long)
-                
-                # Start Training
-                torch.set_grad_enabled(True)
-
-                # Train Neural SLAM Module
-                if self.train_slam and len(self.slam_memory) > self.slam_batch_size:
-                    self.train_slam_module()
-                    
-                # Train Local Policy
-                if self.train_local and (local_step + 1) % self.local_policy_update_freq == 0:
-                    self.train_local_policy()
-                    
-                # Train Global Policy
-                if step == self.max_episode_length - 1:
-                    self.train_global_policy()
-                    
-                # Finish Training
-                torch.set_grad_enabled(False)
-                
-            # post process
-            total_num_steps = (episode + 1) * self.max_episode_length * self.n_rollout_threads
-            
-            #self.convert_info()
-            print("average episode merge explored reward is {}".format(np.mean(self.env_infos["sum_merge_explored_reward"])))
-            print("average episode merge explored ratio is {}".format(np.mean(self.env_infos['sum_merge_explored_ratio'])))
-            print("average episode merge repeat area is {}".format(np.mean(self.env_infos['sum_merge_repeat_area'])))
-
-            # log information
-            if episode % self.log_interval == 0:
-                end = time.time()
-                print("\n Scenario {} Algo {} Exp {} updates {}/{} episodes, total num timesteps {}/{}, FPS {}.\n"
-                        .format(self.all_args.scenario_name,
-                                self.algorithm_name,
-                                self.experiment_name,
-                                episode,
-                                episodes,
-                                total_num_steps,
-                                self.num_env_steps,
-                                int(total_num_steps / (end - start))))
-
-                self.log_env(self.train_slam_infos, total_num_steps)
-                self.log_env(self.train_local_infos, total_num_steps)
-                self.log_env(self.train_global_infos, total_num_steps)
-                self.log_env(self.env_infos, total_num_steps)
-                self.log_async_agent(self.env_infos, total_num_steps)
-            
-            #save model
-            if (episode % self.save_interval == 0 or episode == episodes - 1):
-                self.save_slam_model(total_num_steps)
-                self.save_global_model(total_num_steps)
-                self.save_local_model(total_num_steps)
-
+   
     def get_local_map_boundaries(self, agent_loc, local_sizes, full_sizes):
         loc_r, loc_c = agent_loc
         local_w, local_h = local_sizes
@@ -390,58 +89,116 @@ class GraphHabitatRunner(Runner):
         self.map_size_cm = self.all_args.map_size_cm
         self.map_resolution = self.all_args.map_resolution
         self.global_downscaling = self.all_args.global_downscaling
+
         self.frame_width = self.all_args.frame_width
+       
         self.load_local = self.all_args.load_local
         self.load_slam = self.all_args.load_slam
         self.train_local = self.all_args.train_local
         self.train_slam = self.all_args.train_slam
+
+        self.proj_frontier = self.all_args.proj_frontier
+
         self.slam_memory_size = self.all_args.slam_memory_size
         self.slam_batch_size = self.all_args.slam_batch_size
         self.slam_iterations = self.all_args.slam_iterations
         self.slam_lr = self.all_args.slam_lr
         self.slam_opti_eps = self.all_args.slam_opti_eps
+
         self.use_local_recurrent_policy = self.all_args.use_local_recurrent_policy
         self.local_hidden_size = self.all_args.local_hidden_size
         self.local_lr = self.all_args.local_lr
         self.local_opti_eps = self.all_args.local_opti_eps
+
         self.proj_loss_coeff = self.all_args.proj_loss_coeff
         self.exp_loss_coeff = self.all_args.exp_loss_coeff
         self.pose_loss_coeff = self.all_args.pose_loss_coeff
+
         self.local_policy_update_freq = self.all_args.local_policy_update_freq
         self.num_local_steps = self.all_args.num_local_steps
         self.max_episode_length = self.all_args.max_episode_length
         self.render_merge = self.all_args.render_merge
         self.visualize_input = self.all_args.visualize_input
         self.use_intrinsic_reward = self.all_args.use_intrinsic_reward
+        self.use_delta_reward = self.all_args.use_delta_reward
+        self.use_abs_orientation = self.all_args.use_abs_orientation
+        
+        self.use_resnet = self.all_args.use_resnet
         self.map_threshold = self.all_args.map_threshold
         self.use_max = self.all_args.use_max
+        self.use_orientation = self.all_args.use_orientation
+        self.use_vector_agent_id = self.all_args.use_vector_agent_id
+        self.use_cnn_agent_id = self.all_args.use_cnn_agent_id
+        self.use_own = self.all_args.use_own
+        self.use_new_trace = self.all_args.use_new_trace
+        self.use_weight_trace = self.all_args.use_weight_trace
+        self.decay_weight = self.all_args.decay_weight
+        self.use_merge_goal = self.all_args.use_merge_goal
+        self.use_single_agent_trace = self.all_args.use_single_agent_trace
         self.use_local = self.all_args.use_local
         self.local_map_w = self.all_args.local_map_w
         self.local_map_h = self.all_args.local_map_h
-        self.use_local_single_map = self.all_args.use_local_single_map
+        self.use_seperated_cnn_model = self.all_args.use_seperated_cnn_model
+        self.grid_pos = self.all_args.grid_pos
+        self.grid_agent_id = self.all_args.grid_agent_id
+        self.agent_invariant = self.all_args.agent_invariant
 
+        self.grid_size = self.all_args.grid_size
+        self.discrete_goal = self.all_args.discrete_goal
+        self.multidiscrete_goal = self.all_args.multidiscrete_goal
+        self.direction_goal = self.all_args.direction_goal
+        self.grid_goal = self.all_args.grid_goal
+        self.action_mask = self.all_args.action_mask
+        self.grid_goal_simpler = self.all_args.grid_goal_simpler
+        self.use_goal_penalty = self.all_args.use_goal_penalty
+        self.use_pos_penalty = self.all_args.use_pos_penalty
+        self.use_single = self.all_args.use_single
+        self.use_map_agent_id = self.all_args.use_map_agent_id
+        self.use_goal = self.all_args.use_goal
+        self.use_single_merge = self.all_args.use_single_merge
+        self.use_local_single_map = self.all_args.use_local_single_map
+        self.use_agent_id = self.all_args.use_agent_id
+        self.use_self_grid_pos = self.all_args.use_self_grid_pos
+        self.grid_last_goal = self.all_args.grid_last_goal
+        
         #build graph
         self.learn_to_build_graph = self.all_args.learn_to_build_graph
         self.graph_memory_size = self.all_args.graph_memory_size
         self.paro_frame_width = self.all_args.paro_frame_width
         self.paro_frame_height = self.all_args.paro_frame_height
         self.feature_dim = self.all_args.feature_dim
+        self.direct_action = self.all_args.direct_action
+        self.several_direct_actions = self.all_args.several_direct_actions
+        self.use_id_embedding = self.all_args.use_id_embedding
         self.add_ghost = self.all_args.add_ghost
+        self.use_num_embedding = self.all_args.use_num_embedding
         self.use_merge = self.all_args.use_merge
         self.use_global_goal = self.all_args.use_global_goal
+        self.use_each_node = self.all_args.use_each_node
+        self.use_goal_embedding = self.all_args.use_goal_embedding
         self.use_frontier = self.all_args.use_frontier
+        self.use_tail_agent_info = self.all_args.use_tail_agent_info
+        self.use_agent_node = self.all_args.use_agent_node
+        self.use_distance = self.all_args.use_distance
         self.use_mgnn = self.all_args.use_mgnn
         self.use_map_critic = self.all_args.use_map_critic
+        self.use_mtsp = self.all_args.use_mtsp
+        self.use_mtsp2 = self.all_args.use_mtsp2
         self.use_frontier_nodes = self.all_args.use_frontier_nodes
         self.max_frontier = self.all_args.max_frontier
+        self.use_several_nodes = self.all_args.use_several_nodes
         self.use_all_ghost_add = self.all_args.use_all_ghost_add
-        self.use_ghost_goal_penalty = self.all_args.use_ghost_goal_penalty
+        self.use_gohst_goal_penalty = self.all_args.use_gohst_goal_penalty
+        self.use_batch_train = self.all_args.use_batch_train
+        self.use_submap = self.all_args.use_submap
+        self.sub_size = self.all_args.sub_size
         self.use_render = self.all_args.use_render
         self.ghost_node_size = self.all_args.ghost_node_size
+        self.use_subratio = self.all_args.use_subratio
+        self.first_compute_in_run = False
         self.use_double_matching = self.all_args.use_double_matching
-        self.use_ft_frontiers = self.all_args.use_ft_frontiers
-        self.use_single = self.all_args.use_single
-        
+        self.use_here_rotation = self.all_args.use_here_rotation
+        self.use_noisy_render = self.all_args.use_noisy_render
 
     def init_map_variables(self):
         ### Full map consists of 4 channels containing the following:
@@ -456,6 +213,8 @@ class GraphHabitatRunner(Runner):
         self.local_w, self.local_h = int(self.full_w / self.global_downscaling), \
                         int(self.full_h / self.global_downscaling)
         self.center_w, self.center_h = self.full_w//2, self.full_h//2
+        if self.use_resnet:
+            self.res_w = self.res_h = 224
 
         # Initializing full, merge and local map
         self.full_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
@@ -472,6 +231,7 @@ class GraphHabitatRunner(Runner):
 
         # Local Map Boundaries
         self.lmb = np.zeros((self.n_rollout_threads, self.num_agents, 4)).astype(int)
+        
         self.local_lmb = np.zeros((self.n_rollout_threads, self.num_agents, 4)).astype(int)
 
         ### Planner pose inputs has 7 dimensions
@@ -480,17 +240,23 @@ class GraphHabitatRunner(Runner):
         self.planner_pose_inputs = np.zeros((self.n_rollout_threads, self.num_agents, 7), dtype=np.float32)
         
         # each agent rotation
+        self.other_agent_rotation = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
         if self.use_local:
             self.agent_merge_map = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.full_w, self.full_h), dtype=np.float32)
+        if self.use_cnn_agent_id:
+            self.agent_pos_map = np.zeros((self.n_rollout_threads, self.num_agents, self.full_w, self.full_h), dtype=np.float32)
+        if self.use_single_agent_trace:
+            self.agent_trace_map = np.zeros((self.n_rollout_threads, self.num_agents, self.full_w, self.full_h), dtype=np.float32)
+        if self.grid_agent_id or self.grid_pos:
+            self.grid_locs = np.zeros((self.n_rollout_threads, self.num_agents, 2), dtype=np.int32)
         self.world_locs = np.zeros((self.n_rollout_threads, self.num_agents, 2), dtype=np.int32)
-        
+        if self.grid_last_goal:
+            self.grid_goal_pos = np.zeros((self.n_rollout_threads, self.num_agents, 2), dtype=np.int32)
         #graph
         self.visual_encoder = self.load_visual_encoder(self.feature_dim)
         # ft
         self.ft_merge_map = np.zeros((self.n_rollout_threads, 2, self.full_w, self.full_h), dtype = np.float32) # only explored and obstacle
         self.ft_goals = np.zeros((self.n_rollout_threads, self.num_agents, 2), dtype = np.int32)
-        self.ft_training = [[[] for _ in range(self.num_agents)] for _ in range(self.n_rollout_threads)]
-        self.ft_training_pre = [[[] for _ in range(self.num_agents)] for _ in range(self.n_rollout_threads)]
         self.ft_pre_goals = np.zeros((self.n_rollout_threads, self.num_agents, 2), dtype = np.int32)
         self.ft_last_merge_explored_ratio = np.zeros((self.n_rollout_threads, 1), dtype= np.float32)
         self.ft_mask = np.ones((self.full_w, self.full_h), dtype=np.int32)
@@ -502,8 +268,11 @@ class GraphHabitatRunner(Runner):
     def init_map_and_pose(self):
         self.full_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
         self.full_pose = np.zeros((self.n_rollout_threads, self.num_agents, 3), dtype=np.float32)
+        self.intrinsic_gt = np.zeros((self.n_rollout_threads, self.num_agents, self.full_w, self.full_h), dtype=np.float32)
         self.merge_goal_trace = np.zeros((self.n_rollout_threads, self.num_agents, self.full_w, self.full_h), dtype=np.float32)
         self.full_pose[:, :, :2] = self.map_size_cm / 100.0 / 2.0
+        
+            
         locs = self.full_pose
         self.planner_pose_inputs[:, :, :3] = locs
         for e in range(self.n_rollout_threads):
@@ -513,38 +282,19 @@ class GraphHabitatRunner(Runner):
                                 int(c * 100.0 / self.map_resolution)]
 
                 self.full_map[e, a, 2:, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1
+
                 self.lmb[e, a] = self.get_local_map_boundaries((loc_r, loc_c),
                                                     (self.local_w, self.local_h),
                                                     (self.full_w, self.full_h))
+
                 self.planner_pose_inputs[e, a, 3:] = self.lmb[e, a].copy()
                 self.origins[e, a] = [self.lmb[e, a, 2] * self.map_resolution / 100.0,
                                 self.lmb[e, a, 0] * self.map_resolution / 100.0, 0.]
+
         for e in range(self.n_rollout_threads):
             for a in range(self.num_agents):
                 self.local_map[e, a] = self.full_map[e, a, :, self.lmb[e, a, 0]:self.lmb[e, a, 1], self.lmb[e, a, 2]:self.lmb[e, a, 3]]
                 self.local_pose[e, a] = self.full_pose[e, a] - self.origins[e, a]
-    
-    def init_each_map_and_pose(self, e):
-        self.full_map[e] = np.zeros((self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
-        self.full_pose[e] = np.zeros((self.num_agents, 3), dtype=np.float32)
-        self.merge_goal_trace[e] = np.zeros((self.num_agents, self.full_w, self.full_h), dtype=np.float32)
-        self.full_pose[e, :, :2] = self.map_size_cm / 100.0 / 2.0       
-        locs = self.full_pose[e]
-        self.planner_pose_inputs[e, :, :3] = locs
-        for a in range(self.num_agents):
-            r, c = locs[a, 1], locs[a, 0]
-            loc_r, loc_c = [int(r * 100.0 / self.map_resolution),
-                            int(c * 100.0 / self.map_resolution)]
-            self.full_map[e, a, 2:, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1
-            self.lmb[e, a] = self.get_local_map_boundaries((loc_r, loc_c),
-                                                (self.local_w, self.local_h),
-                                                (self.full_w, self.full_h))
-            self.planner_pose_inputs[e, a, 3:] = self.lmb[e, a].copy()
-            self.origins[e, a] = [self.lmb[e, a, 2] * self.map_resolution / 100.0,
-                            self.lmb[e, a, 0] * self.map_resolution / 100.0, 0.]
-        for a in range(self.num_agents):
-            self.local_map[e, a] = self.full_map[e, a, :, self.lmb[e, a, 0]:self.lmb[e, a, 1], self.lmb[e, a, 2]:self.lmb[e, a, 3]]
-            self.local_pose[e, a] = self.full_pose[e, a] - self.origins[e, a]
 
     def init_keys(self):
         # train keys
@@ -558,28 +308,28 @@ class GraphHabitatRunner(Runner):
         
         # log keys
         if self.num_agents==1:
-            self.agents_env_info_keys = ['sum_explored_ratio','sum_overlap_reward','sum_explored_reward','sum_intrinsic_merge_explored_reward','sum_repeat_area','explored_ratio_step']
+            self.agents_env_info_keys = ['sum_explored_ratio','sum_overlap_reward','sum_explored_reward','sum_intrinsic_merge_explored_reward','sum_repeat_area','explored_ratio_step',\
+                '50step_auc','100step_auc','150step_auc','200step_auc','250step_auc','300step_auc','350step_auc','400step_auc','450step_auc']
             self.env_info_keys = ['sum_merge_explored_ratio','sum_merge_explored_reward','sum_merge_repeat_area','merge_overlap_ratio', 'merge_overlap_ratio_0.3', 'merge_overlap_ratio_0.5', 'merge_overlap_ratio_0.7', 'merge_explored_ratio_step','merge_explored_ratio_step_0.95', 'merge_global_goal_num', 'merge_global_goal_num_%.2f'%self.all_args.explored_ratio_down_threshold,\
+                '50step_merge_auc','100step_merge_auc','150step_merge_auc','200step_merge_auc','250step_merge_auc','300step_merge_auc','350step_merge_auc','400step_merge_auc','450step_merge_auc',
                 '50step_merge_overlap_ratio','100step_merge_overlap_ratio','150step_merge_overlap_ratio','200step_merge_overlap_ratio','250step_merge_overlap_ratio','300step_merge_overlap_ratio','350step_merge_overlap_ratio','400step_merge_overlap_ratio','450step_merge_overlap_ratio']
         else:
-            self.agents_env_info_keys = ['sum_explored_ratio','sum_overlap_reward','sum_explored_reward','sum_intrinsic_merge_explored_reward','sum_repeat_area','explored_ratio_step']
+            self.agents_env_info_keys = ['sum_explored_ratio','sum_overlap_reward','sum_explored_reward','sum_intrinsic_merge_explored_reward','sum_repeat_area','explored_ratio_step',\
+                '50step_auc','100step_auc','120step_auc','150step_auc','180step_auc','200step_auc','250step_auc','300step_auc']
             self.env_info_keys = ['sum_merge_explored_ratio','sum_merge_explored_reward','sum_merge_repeat_area','merge_overlap_ratio', 'merge_overlap_ratio_0.3', 'merge_overlap_ratio_0.5', 'merge_overlap_ratio_0.7', 'merge_explored_ratio_step','merge_explored_ratio_step_0.95', 'merge_global_goal_num', 'merge_global_goal_num_%.2f'%self.all_args.explored_ratio_down_threshold,\
+                '50step_merge_auc','100step_merge_auc','120step_merge_auc','150step_merge_auc','180step_merge_auc','200step_merge_auc','250step_merge_auc','300step_merge_auc',
                 '50step_merge_overlap_ratio','100step_merge_overlap_ratio','120step_merge_overlap_ratio','150step_merge_overlap_ratio','180step_merge_overlap_ratio','200step_merge_overlap_ratio','250step_merge_overlap_ratio','300step_merge_overlap_ratio']
              
         if self.use_eval:
             self.agents_env_info_keys += ['sum_path_length', 'path_length/ratio', "balanced_ratio"]
             self.sum_env_info_keys  += ['path_length']
             self.equal_env_info_keys  += ['path_length/ratio',"balanced_ratio"]
+            self.auc_infos_keys = ['merge_auc','agent_auc']
             self.env_info_keys += ['merge_runtime'] 
 
         # convert keys
         self.env_infos_keys = self.agents_env_info_keys + self.env_info_keys + \
                         ['max_sum_merge_explored_ratio','min_sum_merge_explored_ratio','merge_success_rate','invalid_merge_explored_ratio_step_num','invalid_merge_map_num'] 
-    
-    def init_env_infos(self):
-        self.env_infos = {}
-        for key in self.env_infos_keys:
-            self.env_infos[key] = []
 
     def init_global_policy(self, first_init=False):
         if first_init == True:
@@ -593,32 +343,31 @@ class GraphHabitatRunner(Runner):
             # env info
             self.env_infos = {}
             for key in self.env_infos_keys:
-                self.env_infos[key] = []
+                self.env_infos[key] = deque(maxlen=length)
 
         self.global_input = {}
-        if self.learn_to_build_graph or self.use_frontier_nodes:
+
+        if self.learn_to_build_graph:
             self.last_ghost_world_pos = np.zeros((self.n_rollout_threads, (self.episode_length+1)*self.num_agents, 3), dtype = np.float32)
             self.last_agent_world_pos = np.zeros((self.n_rollout_threads, (self.episode_length+1)*self.num_agents, 3), dtype = np.float32)
             if self.use_double_matching:
                 self.global_input['agent_graph_node_dis'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_agents, self.graph_memory_size, 1), dtype = np.float32)
                 self.global_input['graph_node_pos'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size, 4), dtype = np.float32)
                 self.global_input['graph_last_node_position'] = np.zeros((self.n_rollout_threads, self.num_agents, self.episode_length*self.num_agents, 4), dtype = np.float32)
-            if self.use_frontier_nodes:
-                self.global_input['graph_ghost_node_position'] = np.zeros((self.n_rollout_threads, self.num_agents, self.max_frontier, 4), dtype = np.float32)
-            else:
-                self.global_input['graph_ghost_node_position'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size, self.ghost_node_size, 4), dtype = np.float32)
+           
+            self.global_input['graph_ghost_node_position'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size, self.ghost_node_size, 4), dtype = np.float32)
             self.global_input['agent_world_pos'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_agents, 4), dtype = np.float32)
             self.global_input['graph_last_ghost_node_position'] = np.zeros((self.n_rollout_threads, self.num_agents, self.episode_length*self.num_agents, 4), dtype = np.float32)
             self.global_input['graph_last_agent_world_pos'] = np.zeros((self.n_rollout_threads, self.num_agents, self.episode_length*self.num_agents, 4), dtype = np.float32)
             if self.use_mgnn:
+                
+                
                 self.global_input['graph_last_pos_mask'] = np.zeros((self.n_rollout_threads, self.num_agents, self.episode_length*self.num_agents, 1), dtype = np.int32)
-                if self.use_frontier_nodes:
-                    self.global_input['graph_agent_dis'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_agents, self.max_frontier, 1), dtype = np.float32)
-                else:
-                    self.global_input['graph_agent_dis'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_agents, self.graph_memory_size*self.ghost_node_size, 1), dtype = np.float32)
+               
+                
+                self.global_input['graph_agent_dis'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_agents, self.graph_memory_size*self.ghost_node_size, 1), dtype = np.float32)
 
-                if self.use_frontier_nodes:
-                    self.global_input['graph_merge_frontier_mask'] = np.zeros((self.n_rollout_threads, self.num_agents, self.max_frontier), dtype = np.int32)
+                
                 if self.use_map_critic:
                     self.global_input['global_merge_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, 6, self.local_w, self.local_h), dtype=np.float32)
                     self.global_input['global_merge_goal'] = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.local_w, self.local_h), dtype=np.float32)
@@ -638,10 +387,12 @@ class GraphHabitatRunner(Runner):
                     self.global_input['graph_merge_global_A'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size, self.graph_memory_size), dtype = np.int32)
                     self.global_input['graph_merge_global_time'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size), dtype = np.int32)
                     self.global_input['graph_merge_localized_idx'] = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype = np.int32)
-
+                if self.use_tail_agent_info:
+                    self.global_input['graph_agent_id']= np.zeros((self.n_rollout_threads, self.num_agents,self.num_agents), dtype = np.float32)
+                if self.use_distance:
+                    self.global_input['graph_merge_global_D'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size, self.graph_memory_size), dtype = np.int32)
                 if self.add_ghost:
                     self.global_input['graph_merge_ghost_feature'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size,self.ghost_node_size, self.feature_dim), dtype = np.float32)
-                    
                     self.global_input['graph_merge_ghost_mask'] = np.zeros((self.n_rollout_threads, self.num_agents, self.graph_memory_size, self.ghost_node_size), dtype = np.int32)
                     
             self.global_input['graph_panoramic_rgb'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_agents, self.paro_frame_height, self.paro_frame_width, 3), dtype = np.float32)
@@ -649,12 +400,47 @@ class GraphHabitatRunner(Runner):
             if not self.use_mgnn:
                 self.global_input['graph_time'] = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype = np.int32)
                 self.global_input['graph_prev_actions'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_local_steps), dtype = np.int32)
-        self.share_global_input = self.global_input.copy()  
+            if self.use_agent_node:
+                self.global_input['graph_curr_vis_embedding'] = np.zeros((self.n_rollout_threads, self.num_agents, self.num_agents, self.feature_dim), dtype=np.float32)
+                self.global_input['graph_agent_mask'] = np.ones((self.n_rollout_threads, self.num_agents, self.num_agents), dtype = np.int32)
+            if self.use_goal_embedding:
+                self.global_input['graph_prev_goal'] = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype = np.int32)
+           
+        else:  
+            
+            if self.use_single:
+                self.global_input['global_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.local_w, self.local_h), dtype=np.float32)
+                if self.use_goal:
+                    self.global_input['global_goal'] = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.local_w, self.local_h), dtype=np.float32)
+                if self.use_single_merge:
+                    self.global_input['global_merge_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.local_w, self.local_h), dtype=np.float32)
+            else:
+                if self.use_local:
+                    if self.use_seperated_cnn_model:
+                        self.global_input['global_merge_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.local_map_w, self.local_map_h), dtype=np.float32)
+                        self.global_input['local_merge_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.local_map_w, self.local_map_h), dtype=np.float32)
+                    else:
+                        self.global_input['global_merge_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, 8, self.local_map_w, self.local_map_h), dtype=np.float32)
+                    if self.use_merge_goal:
+                        self.global_input['global_merge_goal'] = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.local_map_w, self.local_map_h), dtype=np.float32)
+                else:
+                    self.global_input['global_merge_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.local_w, self.local_h), dtype=np.float32)
+                    
+            
+            if self.use_merge_goal:
+                self.global_input['global_merge_goal'] = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.local_w, self.local_h), dtype=np.float32) 
+        
+        
+            
+        self.share_global_input = self.global_input.copy()
+        
         if self.use_centralized_V:
             if self.use_local:
                 self.share_global_input['gt_map'] = np.zeros((self.n_rollout_threads, self.num_agents, 1, self.local_map_w, self.local_map_h), dtype=np.float32)
             else:
                 self.share_global_input['gt_map'] = np.zeros((self.n_rollout_threads, self.num_agents, 1, self.local_w, self.local_h), dtype=np.float32)
+    
+    
         self.global_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32) 
         if self.add_ghost:
             self.global_goal = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
@@ -671,81 +457,9 @@ class GraphHabitatRunner(Runner):
             self.fig, self.ax = plt.subplots(self.num_agents*2, 8, figsize=(10, 2.5), facecolor="whitesmoke")
             self.fig_d, self.ax_d = plt.subplots(self.num_agents, 3 * self.all_args.direction_k + 1, figsize=(10, 2.5), facecolor = "whitesmoke")
 
-    def init_each_global_policy(self, e):
-        if self.learn_to_build_graph or self.use_frontier_nodes:
-            self.last_ghost_world_pos[e] = np.zeros(((self.episode_length+1)*self.num_agents, 3), dtype = np.float32)
-            self.last_agent_world_pos[e] = np.zeros(((self.episode_length+1)*self.num_agents, 3), dtype = np.float32)
-            if self.use_double_matching:
-                self.global_input['agent_graph_node_dis'][e] = np.zeros((self.num_agents, self.num_agents, self.graph_memory_size, 1), dtype = np.float32)
-                self.global_input['graph_node_pos'][e] = np.zeros((self.num_agents, self.graph_memory_size, 4), dtype = np.float32)
-                self.global_input['graph_last_node_position'][e] = np.zeros((self.num_agents, self.episode_length*self.num_agents, 4), dtype = np.float32)
-            if self.use_frontier_nodes:
-                self.global_input['graph_ghost_node_position'][e] = np.zeros((self.num_agents, self.max_frontier, 4), dtype = np.float32)
-            else:
-                self.global_input['graph_ghost_node_position'][e] = np.zeros((self.num_agents, self.graph_memory_size, self.ghost_node_size, 4), dtype = np.float32)
-            self.global_input['agent_world_pos'][e] = np.zeros((self.num_agents, self.num_agents, 4), dtype = np.float32)
-            self.global_input['graph_last_ghost_node_position'][e] = np.zeros((self.num_agents, self.episode_length*self.num_agents, 4), dtype = np.float32)
-            self.global_input['graph_last_agent_world_pos'][e] = np.zeros((self.num_agents, self.episode_length*self.num_agents, 4), dtype = np.float32)
-            if self.use_mgnn:
-                
-                self.global_input['graph_last_pos_mask'][e] = np.zeros((self.num_agents, self.episode_length*self.num_agents, 1), dtype = np.int32)
-             
-                if self.use_frontier_nodes:
-                    self.global_input['graph_agent_dis'][e] = np.zeros((self.num_agents, self.num_agents, self.max_frontier, 1), dtype = np.float32)
-                else:
-                    self.global_input['graph_agent_dis'][e] = np.zeros((self.num_agents, self.num_agents, self.graph_memory_size*self.ghost_node_size, 1), dtype = np.float32)
-
-                if self.use_frontier_nodes:
-                    self.global_input['graph_merge_frontier_mask'][e] = np.zeros((self.num_agents, self.max_frontier), dtype = np.int32)
-                if self.use_map_critic:
-                    self.global_input['global_merge_obs'][e] = np.zeros((self.num_agents, 6, self.local_w, self.local_h), dtype=np.float32)
-                    self.global_input['global_merge_goal'][e] = np.zeros((self.num_agents, 2, self.local_w, self.local_h), dtype=np.float32)
-            if self.use_single:
-                self.global_input['graph_global_memory'][e] = np.zeros((self.num_agents, self.num_agents*self.graph_memory_size, self.feature_dim), dtype = np.float32)
-                self.global_input['graph_global_mask'][e] = np.zeros((self.num_agents, self.num_agents*self.graph_memory_size), dtype = np.int32)
-                self.global_input['graph_global_time'][e] = np.zeros((self.num_agents, self.num_agents*self.graph_memory_size), dtype = np.int32)
-                self.global_input['graph_localized_idx'][e] = np.zeros((self.num_agents, self.num_agents*1), dtype = np.int32)
-                self.global_input['graph_global_A'][e] = np.zeros(( self.num_agents, self.num_agents*self.graph_memory_size, self.graph_memory_size), dtype = np.int32)
-            if self.use_merge:
-                if self.all_args.use_edge_info == 'learned':
-                    self.global_input['merge_node_pos'][e] = np.zeros((self.num_agents, self.graph_memory_size), dtype = np.int32)
-                if not self.use_mgnn:
-                    self.global_input['graph_ghost_valid_mask'][e] = np.zeros(( self.num_agents, self.graph_memory_size*self.ghost_node_size, self.graph_memory_size*self.ghost_node_size), dtype = np.float32)
-                    self.global_input['graph_merge_global_memory'][e] = np.zeros(( self.num_agents, self.graph_memory_size, self.feature_dim), dtype = np.float32)
-                    self.global_input['graph_merge_global_mask'][e] = np.zeros(( self.num_agents, self.graph_memory_size), dtype = np.int32)
-                    self.global_input['graph_merge_global_A'][e] = np.zeros((self.num_agents, self.graph_memory_size, self.graph_memory_size), dtype = np.int32)
-                    self.global_input['graph_merge_global_time'][e] = np.zeros(( self.num_agents, self.graph_memory_size), dtype = np.int32)
-                    self.global_input['graph_merge_localized_idx'][e] = np.zeros((self.num_agents, 1), dtype = np.int32)
-                if self.add_ghost:
-                    self.global_input['graph_merge_ghost_feature'][e] = np.zeros((self.num_agents, self.graph_memory_size,self.ghost_node_size, self.feature_dim), dtype = np.float32)
-                   
-                    self.global_input['graph_merge_ghost_mask'][e] = np.zeros(( self.num_agents, self.graph_memory_size, self.ghost_node_size), dtype = np.int32)    
-            self.global_input['graph_panoramic_rgb'][e] = np.zeros(( self.num_agents, self.num_agents, self.paro_frame_height, self.paro_frame_width, 3), dtype = np.float32)
-            self.global_input['graph_panoramic_depth'][e] = np.zeros((self.num_agents, self.num_agents, self.paro_frame_height, self.paro_frame_width, 1), dtype = np.float32)
-            if not self.use_mgnn:
-                self.global_input['graph_time'][e] = np.zeros(( self.num_agents, 1), dtype = np.int32)
-                self.global_input['graph_prev_actions'][e] = np.zeros(( self.num_agents, self.num_local_steps), dtype = np.int32)
-
-        self.share_global_input = self.global_input.copy()
-        
-        if self.use_centralized_V:
-            if self.use_local:
-                self.share_global_input['gt_map'][e] = np.zeros((self.num_agents, 1, self.local_map_w, self.local_map_h), dtype=np.float32)
-            else:
-                self.share_global_input['gt_map'][e] = np.zeros(( self.num_agents, 1, self.local_w, self.local_h), dtype=np.float32)
-        self.global_masks[e] = np.ones(( self.num_agents, 1), dtype=np.float32) 
-        if self.add_ghost:
-            self.global_goal[e] = np.zeros(( self.num_agents, 1), dtype=np.float32)
-        else:
-            self.global_goal[e] = np.zeros(( self.num_agents, 1), dtype=np.float32)
-        if self.use_double_matching:
-            self.node_goal[e] = np.zeros((self.num_agents, 2), dtype=np.float32)
-        self.revise_global_goal[e] = np.zeros(( self.num_agents, 2), dtype=np.int32)
-        self.rewards[e] = np.zeros(( self.num_agents, 1), dtype=np.float32) 
-        self.global_goal_position[e]  = np.zeros(( self.num_agents, 2), dtype=np.int32)
-
     def init_local_policy(self):
         self.best_local_loss = np.inf
+
         self.train_local_infos = {}
         for key in self.train_local_infos_keys:
             self.train_local_infos[key] = deque(maxlen=1000)
@@ -795,21 +509,7 @@ class GraphHabitatRunner(Runner):
         else:
             self.slam_memory = FIFOMemory(self.slam_memory_size)
             self.slam_optimizer = torch.optim.Adam(self.nslam_module.parameters(), lr=self.slam_lr, eps=self.slam_opti_eps)
-    
-    def init_each_env_info(self, e):
-        for key in self.agents_env_info_keys:
-            if "step" in key:
-                self.env_info[key][e] = np.ones((self.num_agents), dtype=np.float32) * self.max_episode_length
-            else:
-                self.env_info[key][e] = np.zeros((self.num_agents), dtype=np.float32)
-        
-        for key in self.env_info_keys:
-            if "step" in key:
-                self.env_info[key][e] = self.max_episode_length
-            else:
-                self.env_info[key][e] = 0
-    
-    
+
     def init_env_info(self):
         self.env_info = {}
 
@@ -848,25 +548,12 @@ class GraphHabitatRunner(Runner):
                 self.env_infos[k].append(v)
                 print('mean valid {}: {}'.format(k, np.nanmean(v_copy)))
             else:
-                self.env_infos[k].append(v)
+                if k != 'auc':
+                    self.env_infos[k].append(v)
                 if k == 'sum_merge_explored_ratio':       
                     self.env_infos['max_sum_merge_explored_ratio'].append(np.max(v))
                     self.env_infos['min_sum_merge_explored_ratio'].append(np.min(v))
                     print(np.mean(v))
-    
-    def convert_each_info(self, e):
-        for k, v in self.env_info.items():
-            if k == "explored_ratio_step":
-                self.env_infos[k].append(v[e].copy())
-              
-            elif k == "merge_explored_ratio_step":
-                if v[e] == self.max_episode_length:
-                    self.env_infos['invalid_merge_map_num'].append(v[e].copy())
-                self.env_infos[k].append(v[e].copy())
-               
-            else:
-                self.env_infos[k].append(v[e].copy())
-               
 
     def load_visual_encoder(self, feature_dim):
         visual_encoder = resnet18(num_classes=feature_dim)
@@ -883,7 +570,10 @@ class GraphHabitatRunner(Runner):
         with torch.no_grad():
             for e in range(self.n_rollout_threads):
                 img_tensor = torch.cat((torch.tensor(obs_batch[e]['graph_panoramic_rgb'])/255.0, torch.tensor(obs_batch[e]['graph_panoramic_depth'])),3).permute(0,3,1,2)
-                vis_embedding = nn.functional.normalize(self.visual_encoder(img_tensor).view(self.num_agents,-1),dim=1)
+                if self.all_args.use_retrieval:
+                    vis_embedding = nn.functional.normalize(self.visual_encoder.extract(img_tensor).view(self.num_agents,-1),dim=1)
+                else:
+                    vis_embedding = nn.functional.normalize(self.visual_encoder(img_tensor).view(self.num_agents,-1),dim=1)
                 obs_batch[e]['graph_curr_vis_embedding'] = vis_embedding.detach().cpu()
         return obs_batch
 
@@ -902,6 +592,7 @@ class GraphHabitatRunner(Runner):
     def run_slam_module(self, last_obs, obs, infos, build_maps=True):
         for a in range(self.num_agents):
             poses = np.array([infos[e]['sensor_pose'][a] for e in range(self.n_rollout_threads)])
+
             _, _, self.local_map[:, a, 0, :, :], self.local_map[:, a, 1, :, :], _, self.local_pose[:, a, :] = \
                 self.nslam_module(last_obs[:, a, :, :, :], obs[:, a, :, :, :], poses, 
                                 self.local_map[:, a, 0, :, :],
@@ -916,16 +607,30 @@ class GraphHabitatRunner(Runner):
             for agent_id in range(self.num_agents):
                 output = torch.from_numpy(inputs[e, agent_id])  
                 n_rotated = F.grid_sample(output.unsqueeze(0).float(), rotation[e][agent_id].float(), align_corners=True)
-                n_map = F.grid_sample(n_rotated.float(), trans[e][agent_id].float(), align_corners=True)  
+                n_map = F.grid_sample(n_rotated.float(), trans[e][agent_id].float(), align_corners=True)
+                     
                 agent_merge_map = n_map[0, :, :, :].numpy()
+
                 (index_a, index_b) = np.unravel_index(np.argmax(agent_merge_map[2, :, :], axis=None), agent_merge_map[2, :, :].shape)
+                
                 agent_merge_map[2, :, :] = np.zeros((self.full_h, self.full_w), dtype=np.float32)
                 if self.first_compute:
-                    agent_merge_map[2, index_a - 1: index_a + 2, index_b - 1: index_b + 2] = 1
-                else:  
-                    agent_merge_map[2, index_a - 2: index_a + 3, index_b - 2: index_b + 3] = 1
-                trace = np.zeros((self.full_h, self.full_w), dtype=np.float32)      
-                trace[agent_merge_map[3] > self.map_threshold] = 1
+                    if self.use_agent_id:
+                        agent_merge_map[2, index_a - 1: index_a + 2, index_b - 1: index_b + 2] = (agent_id + 1)/np.array([aa + 1 for aa in range(self.num_agents)]).sum()
+                    else:
+                        agent_merge_map[2, index_a - 1: index_a + 2, index_b - 1: index_b + 2] = 1
+                else: 
+                    if self.use_agent_id:
+                        agent_merge_map[2, index_a - 2: index_a + 3, index_b - 2: index_b + 3] = (agent_id + 1)/np.array([aa + 1 for aa in range(self.num_agents)]).sum()
+                    else:
+                        agent_merge_map[2, index_a - 2: index_a + 3, index_b - 2: index_b + 3] = 1
+            
+                trace = np.zeros((self.full_h, self.full_w), dtype=np.float32)
+               
+                if self.use_agent_id:
+                    trace[agent_merge_map[3] > self.map_threshold] = (agent_id + 1)/np.array([aa+1 for aa in range(self.num_agents)]).sum()
+                else:
+                    trace[agent_merge_map[3] > self.map_threshold] = 1
                 agent_merge_map[3] = trace
                 if self.use_max:
                     for i in range(2):
@@ -935,8 +640,15 @@ class GraphHabitatRunner(Runner):
                     merge_map[e] += agent_merge_map
                 if self.use_local:
                     self.agent_merge_map[e, agent_id] = agent_merge_map[2:]
+               
                 self.world_locs[e, agent_id, 0] = index_a
                 self.world_locs[e, agent_id, 1] = index_b
+    
+            if not self.use_max:
+                for i in range(2):
+                    merge_map[ e, i][merge_map[ e, i]>1] = 1.0
+                    merge_map[ e, i][merge_map[ e, i]<self.map_threshold] = 0.0
+
         return merge_map
     
     def single_transform(self, inputs, trans, rotation, agent_trans, agent_rotation, a):
@@ -944,20 +656,39 @@ class GraphHabitatRunner(Runner):
         for e in range(self.n_rollout_threads):
             output = torch.from_numpy(inputs[e, a])  
             n_rotated = F.grid_sample(output.unsqueeze(0).float(), rotation[e][a].float(), align_corners=True)
-            n_map = F.grid_sample(n_rotated.float(), trans[e][a].float(), align_corners=True)      
+            n_map = F.grid_sample(n_rotated.float(), trans[e][a].float(), align_corners=True)
+                    
             agent_merge_map = n_map[0, :, :, :].numpy()
+
             (index_a, index_b) = np.unravel_index(np.argmax(agent_merge_map[2, :, :], axis=None), agent_merge_map[2, :, :].shape)
+            
             agent_merge_map[2, :, :] = np.zeros((self.full_h, self.full_w), dtype=np.float32)
             if self.first_compute:
-                agent_merge_map[2, index_a - 1: index_a + 2, index_b - 1: index_b + 2] = 1
+                if self.use_agent_id:
+                    agent_merge_map[2, index_a - 1: index_a + 2, index_b - 1: index_b + 2] = (a + 1)/np.array([aa + 1 for aa in range(self.num_agents)]).sum()
+                else:
+                    agent_merge_map[2, index_a - 1: index_a + 2, index_b - 1: index_b + 2] = 1
             else: 
-                agent_merge_map[2, index_a - 2: index_a + 3, index_b - 2: index_b + 3] = 1
+                if self.use_agent_id:
+                    agent_merge_map[2, index_a - 2: index_a + 3, index_b - 2: index_b + 3] = (a + 1)/np.array([aa + 1 for aa in range(self.num_agents)]).sum()
+                else:
+                    agent_merge_map[2, index_a - 2: index_a + 3, index_b - 2: index_b + 3] = 1
         
             trace = np.zeros((self.full_h, self.full_w), dtype=np.float32)
-            trace[agent_merge_map[3] > self.map_threshold] = 1
-            agent_merge_map[3] = trace
+           
+            if self.use_agent_id:
+                trace[agent_merge_map[3] > self.map_threshold] = (a + 1)/np.array([aa+1 for aa in range(self.num_agents)]).sum()
+            else:
+                trace[agent_merge_map[3] > self.map_threshold] = 1
+            
+            if self.use_new_trace and self.use_weight_trace:
+                agent_merge_map[3] *= trace
+            else:
+                agent_merge_map[3] = trace
+            
             if self.use_local:
                 self.agent_merge_map[e, a] = agent_merge_map[2:]
+
             self.world_locs[e, a, 0] = index_a
             self.world_locs[e, a, 1] = index_b
             single_map[e] = agent_merge_map
@@ -970,29 +701,60 @@ class GraphHabitatRunner(Runner):
             n_rotated = F.grid_sample(output.unsqueeze(0).unsqueeze(0).float(), rotation[e][agent_id].float(), align_corners=True)
             n_map = F.grid_sample(n_rotated.float(), trans[e][agent_id].float(), align_corners=True)    
             gt_world_map[e] = n_map[0, :, :, :].numpy()
-        return gt_world_map
 
+        return gt_world_map
     
     def point_transform(self, agent_id):
         merge_point_map = np.zeros((self.n_rollout_threads, 2, self.full_w, self.full_h), dtype=np.float32)
+        
         for e in range(self.n_rollout_threads):
             for a in range(self.num_agents):
-                if self.use_mgnn:
+                if self.direction_goal:
+                    goal_x = self.global_goal[e, a, 0] * self.full_w
+                    goal_y = self.global_goal[e, a, 1] * self.full_h
+                elif self.use_mgnn:
                     goal_x = self.global_goal_position[e, a, 0]
                     goal_y = self.global_goal_position[e, a, 1]
                 else:
                     goal_x = self.global_goal[e, a, 0]*(self.sim_map_size[e][a][0]+10)+self.center_w-self.sim_map_size[e][a][0]//2-5  
                     goal_y = self.global_goal[e, a, 1]*(self.sim_map_size[e][a][1]+10)+self.center_h-self.sim_map_size[e][a][1]//2-5
-                
-                merge_point_map[e, 0, int(goal_x-2): int(goal_x+3), int(goal_y-2): int(goal_y+3)] += 1
+                if self.use_agent_id:    
+                    merge_point_map[e, 0, int(goal_x-2): int(goal_x+3), int(goal_y-2): int(goal_y+3)] += (a + 1)/np.array([aa+1 for aa in range(self.num_agents)]).sum()
+                else:
+                    merge_point_map[e, 0, int(goal_x-2): int(goal_x+3), int(goal_y-2): int(goal_y+3)] += 1
+            
         self.merge_goal_trace[:, agent_id] =  np.maximum(self.merge_goal_trace[:, agent_id], merge_point_map[:, 0])
         merge_point_map[:, 1] = self.merge_goal_trace[:, agent_id].copy()
+        
+        return merge_point_map
+
+    def single_point_transform(self, a):
+        merge_point_map = np.zeros((self.n_rollout_threads, 2, self.full_w, self.full_h), dtype=np.float32)
+        for e in range(self.n_rollout_threads):
+            goal_x = self.global_goal[e, a, 0]*(self.sim_map_size[e][a][0]+10)+self.center_w-self.sim_map_size[e][a][0]//2-5  
+            goal_y = self.global_goal[e, a, 1]*(self.sim_map_size[e][a][1]+10)+self.center_h-self.sim_map_size[e][a][1]//2-5
+            if self.direction_goal:
+                goal_x = self.global_goal[e, a, 0] * self.full_w
+                goal_y = self.global_goal[e, a, 1] * self.full_h
+            if self.use_agent_id:
+                merge_point_map[e, 0, int(goal_x-2): int(goal_x+3), int(goal_y-2): int(goal_y+3)] = (a + 1)/np.array([aa+1 for aa in range(self.num_agents)]).sum()
+            else:
+                merge_point_map[e, 0, int(goal_x-2): int(goal_x+3), int(goal_y-2): int(goal_y+3)] = 1
+            
+            if self.grid_last_goal:
+                self.grid_goal_pos[e, a, 0] = int((goal_x-(self.full_w/2-self.sim_map_size[e][a][0]//2-5))/((self.sim_map_size[e][a][0]+10)/self.grid_size))
+                self.grid_goal_pos[e, a, 1] = int((goal_y-(self.full_h/2-self.sim_map_size[e][a][1]//2-5))/((self.sim_map_size[e][a][1]+10)/self.grid_size))
+            
+        self.merge_goal_trace[:, a] =  np.maximum(self.merge_goal_trace[:, a], merge_point_map[:, 0])
+        merge_point_map[:, 1] = self.merge_goal_trace[:, a].copy()
+        
         return merge_point_map
 
     def compute_local_merge(self, inputs, single_map, a):
         local_merge_map = np.zeros((self.n_rollout_threads, 4, self.local_map_w, self.local_map_h))
         local_single_map = np.zeros((self.n_rollout_threads, 2, self.local_map_w, self.local_map_h))
         for e in range(self.n_rollout_threads):
+            
             x = int(self.world_locs[e,a,0]-(self.center_w-self.sim_map_size[e][a][0]//2-5))
             y = int(self.world_locs[e,a,1]-(self.center_h-self.sim_map_size[e][a][1]//2-5))
             
@@ -1008,9 +770,11 @@ class GraphHabitatRunner(Runner):
                                     self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: \
                                     self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5]
             local_single_map[e] = single_sim_inputs[ :, self.local_lmb[e, a, 0] :self.local_lmb[e, a, 1], self.local_lmb[e, a, 2]:self.local_lmb[e, a, 3]]
+
+            
         return local_merge_map, local_single_map
     
-    def compute_graph_input(self, infos, first_compute_in_run, global_step):        
+    def compute_graph_input(self, infos, global_step):
         self.merge_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
         global_goal_map = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.full_w, self.full_h), dtype=np.float32)
         global_explorable_map = np.zeros((self.n_rollout_threads, self.num_agents, 1, self.full_w, self.full_h), dtype=np.float32)
@@ -1020,10 +784,10 @@ class GraphHabitatRunner(Runner):
             global_goal_map[:, a] = self.point_transform(a)
             global_explorable_map[:, a] = self.transform_gt(self.explorable_map[:, a], self.trans, self.rotation, a)
         for e in range(self.n_rollout_threads):
-            if first_compute_in_run[e]:
+            if self.first_compute:
                 pass
             else:
-                self.last_ghost_world_pos[e, (global_step[e]-1)*self.num_agents:global_step[e]*self.num_agents] =  np.concatenate((self.global_goal_position[e]/(100//self.map_resolution),\
+                self.last_ghost_world_pos[e, (global_step-1)*self.num_agents:global_step*self.num_agents] =  np.concatenate((self.global_goal_position[e]/(100//self.map_resolution),\
                             np.zeros((self.num_agents,1))), axis = -1)
             pos = infos[e]['graph_ghost_node_position'].reshape(-1,3)
             for i in range(pos.shape[0]):
@@ -1060,8 +824,8 @@ class GraphHabitatRunner(Runner):
             elif key == 'agent_world_pos':
                 for e in range(self.n_rollout_threads):
                     agent_world_pos = infos[e]['world_position'].copy()
-                    agent_world_pos[:,0] = agent_world_pos[:,0] /(self.map_size_cm//100)
-                    agent_world_pos[:,1] = agent_world_pos[:,1] /(self.map_size_cm//100)
+                    agent_world_pos[:,0] = agent_world_pos[:,0]/(self.map_size_cm//100)
+                    agent_world_pos[:,1] = agent_world_pos[:,1]/(self.map_size_cm//100)
                     agent_world_pos[:,2] = 0
                     agent_world_pos = np.concatenate((agent_world_pos, np.ones((self.num_agents,1))), axis = -1)
                     for a in range(self.num_agents):
@@ -1069,20 +833,17 @@ class GraphHabitatRunner(Runner):
             elif key == 'graph_prev_goal':
                 self.global_input[key] = self.goal.copy()
             elif key not in ['graph_merge_localized_idx', 'merge_node_pos','last_graph_merge_ghost_mask'] and 'merge' in key:
-                self.global_input[key] = np.expand_dims(np.array([infos[e][key] for e in range(self.n_rollout_threads)]),1).repeat(self.num_agents, axis=1)
-            elif key == 'graph_agent_dis':
-                position=[{} for e in range(self.n_rollout_threads)]
                 for e in range(self.n_rollout_threads):
-                    position[e]['x'] = infos[e]['world_position'].copy()
-                    if self.use_frontier_nodes:
-                        position[e]['y'] = np.zeros((self.max_frontier, 3),dtype = np.float)
-                        position[e]['y'][:len(infos[e]['frontier_loc'])] = np.array(infos[e]['frontier_loc'],dtype = np.float)[:,[1,0,2]]/(100//self.map_resolution)
-                    else:
+                    self.global_input[key][e] = np.expand_dims(np.array(infos[e][key]),0).repeat(self.num_agents, axis=0)
+            elif key == 'graph_agent_dis':
+                for iter_ in range(self.num_agents):
+                    position=[{} for e in range(self.n_rollout_threads)]
+                    for e in range(self.n_rollout_threads):
+                        position[e]['x'] = infos[e]['world_position'].copy()
                         position[e]['y'] = infos[e]['graph_ghost_node_position'].copy()
-                    position[e]['agent_id'] = None
-                fmm_dis = self.compute_fmm_distance(position)
-                for a in range(self.num_agents):
-                    self.global_input[key][:,a] = np.roll(fmm_dis, -a, axis=1)
+                        position[e]['agent_id'] = None
+                    fmm_dis = self.compute_fmm_distance(position)
+                    self.global_input[key][:,iter_] = np.roll(fmm_dis, -iter_, axis=1)
             elif key == 'graph_agent_mask':
                 pass
             elif key in ['graph_global_memory', 'graph_global_mask', 'graph_global_A', 'graph_global_time', 'graph_localized_idx', 'graph_id_trace']:
@@ -1103,101 +864,87 @@ class GraphHabitatRunner(Runner):
                     world_node_pos = np.concatenate((world_node_pos, np.ones((world_node_pos.shape[0],1))), axis = -1)
                     for agent_id in range(self.num_agents):
                         self.global_input[key][e, agent_id, :len(infos[e]['graph_node_pos'])] = world_node_pos.copy()
-
             elif key == 'agent_graph_node_dis':              
-                position=[{} for _ in range(self.n_rollout_threads)]
-                for e in range(self.n_rollout_threads):
-                    count = len(infos[e]['graph_node_pos'])
-                    position[e]['x'] = infos[e]['world_position'].copy()
-                    position[e]['y'] = np.concatenate((np.array(infos[e]['graph_node_pos']).copy(),np.zeros((self.graph_memory_size-count,3))),axis=0)
-                    position[e]['agent_id'] = None
-                fmm_dis = self.compute_fmm_distance(position)
                 for agent_id in range(self.num_agents):
+                    position=[{} for _ in range(self.n_rollout_threads)]
+                    for e in range(self.n_rollout_threads):
+                        position[e]['x'] = infos[e]['world_position'].copy()
+                        count = len(infos[e]['graph_node_pos'])
+                        position[e]['y'] = np.concatenate((np.array(infos[e]['graph_node_pos']).copy(),np.zeros((self.graph_memory_size-count,3))),axis=0)
+                        position[e]['agent_id']  = None
+                    fmm_dis = self.compute_fmm_distance(position)
                     self.global_input[key][:,agent_id] = np.roll(fmm_dis, -agent_id, axis=1)
             
             elif key == 'graph_last_node_position':
-                for e in range(self.n_rollout_threads):
-                    if first_compute_in_run[e]:
-                        self.global_input[key][e, :, :self.num_agents,2] = 1
-                    else:
+                if self.first_compute:
+                    self.global_input[key][:, :, global_step*self.num_agents:(global_step+1)*self.num_agents,2] = 1
+                else:
+                    for e in range(self.n_rollout_threads):
                         node_world_pos = self.node_goal[e].copy()
                         node_world_pos = np.concatenate((node_world_pos,\
                         np.ones((self.num_agents,1)), np.zeros((self.num_agents,1))), axis=-1)
                         for agent_id in range(self.num_agents):
-                            self.global_input[key][e, agent_id, (global_step[e]-1)*self.num_agents:global_step[e]*self.num_agents] = np.roll(node_world_pos, -agent_id, axis = 0)
+                            self.global_input[key][e, agent_id, (global_step-1)*self.num_agents:global_step*self.num_agents] = np.roll(node_world_pos, -agent_id, axis = 0)
 
             elif key == 'graph_ghost_node_position':
                 self.global_input[key][:,:,:,:] = 0
                 for e in range(self.n_rollout_threads):
-                    if self.use_frontier_nodes:
-                        ghost_world_pos = np.array(infos[e]['frontier_loc'], dtype=np.float)
-                        ghost_world_pos[:,[1,0]] = ghost_world_pos[:,[0,1]]/self.full_w
-                        ghost_world_pos[:,2] = 0
-                        ghost_world_pos = np.concatenate((ghost_world_pos, np.ones((ghost_world_pos.shape[0],1))), axis = -1)
-                    else:
+                    for iter_ in range(self.num_agents):
                         ghost_world_pos = infos[e][key].copy()
                         ghost_world_pos[:,:,0] = ghost_world_pos[:,:,0]/(self.map_size_cm//100)
                         ghost_world_pos[:,:,1] = ghost_world_pos[:,:,1]/(self.map_size_cm//100)
                         ghost_world_pos[:,:,2] = 0
                         ghost_world_pos = np.concatenate((ghost_world_pos, np.ones((self.graph_memory_size,self.ghost_node_size,1))), axis = -1)
-                    
-                    for a in range(self.num_agents):
-                        if self.use_frontier_nodes:
-                            self.global_input[key][e, a, :len(infos[e]['frontier_loc'])] = ghost_world_pos.copy()
-                        else:
-                            self.global_input[key][e, a] = ghost_world_pos.copy()
+                        self.global_input[key][e, iter_] = ghost_world_pos.copy()
+                
             elif key == 'graph_last_ghost_node_position':
-                for e in range(self.n_rollout_threads):
-                    if first_compute_in_run[e]:
-                        self.global_input[key][e, :,:self.num_agents,2] = 1
-                    else:
-                        ghost_world_pos = self.global_goal_position[e]/self.full_h
+                if self.first_compute:
+                    self.global_input[key][:, :, global_step*self.num_agents:(global_step+1)*self.num_agents,2] = 1
+                else:
+                    for e in range(self.n_rollout_threads):
+                        ghost_world_pos = self.global_goal_position[e]/self.full_w
                         ghost_world_pos = np.concatenate((ghost_world_pos,\
                         np.ones((self.num_agents,1)), np.zeros((self.num_agents,1))), axis=-1)
                         for a in range(self.num_agents):
-                            self.global_input[key][e, a, (global_step[e]-1)*self.num_agents:global_step[e]*self.num_agents] = np.roll(ghost_world_pos, -a, axis = 0)
+                            self.global_input[key][e, a, (global_step-1)*self.num_agents:global_step*self.num_agents] = np.roll(ghost_world_pos, -a, axis = 0)
             elif key == 'graph_last_agent_world_pos':
-                for e in range(self.n_rollout_threads):
-                    if first_compute_in_run[e]:
+                if self.first_compute:
+                    for e in range(self.n_rollout_threads):
                         agent_world_pos = infos[e]['world_position'].copy()
                         agent_world_pos[:,0] = agent_world_pos[:,0]/(self.map_size_cm//100)
-                        agent_world_pos[:,1] = agent_world_pos[:,1]/(self.map_size_cm//100)
+                        agent_world_pos[:,1] = agent_world_pos[:,1] /(self.map_size_cm//100)
                         agent_world_pos[:,2] = 1
                         agent_world_pos = np.concatenate((agent_world_pos,np.zeros((self.num_agents,1))), axis = -1)
                         for a in range(self.num_agents):
-                            self.global_input[key][e, a, :self.num_agents] = np.roll(agent_world_pos, -a, axis=0)
-                    else:
-                        last_agent_world_pos = self.last_agent_world_pos[e, (global_step[e]-1)*self.num_agents:global_step[e]*self.num_agents].copy()
-                        last_agent_world_pos[:,0] = last_agent_world_pos[:,0]/(self.map_size_cm//100)
-                        last_agent_world_pos[:,1] =last_agent_world_pos[:,1]/(self.map_size_cm//100)
-                        last_agent_world_pos[:,2] = 1
-                        last_agent_world_pos = np.concatenate((last_agent_world_pos,np.zeros((self.num_agents,1))),axis = -1)
-                        for a in range(self.num_agents):
-                            self.global_input[key][e, a, (global_step[e]-1)*self.num_agents:global_step[e]*self.num_agents] = np.roll(last_agent_world_pos, -a, axis=0)
-
+                            self.global_input[key][e, a, global_step*self.num_agents:(global_step+1)*self.num_agents] = np.roll(agent_world_pos, -a, axis=0)
+                else:
+                    last_agent_world_pos = self.last_agent_world_pos[:, (global_step-1)*self.num_agents:global_step*self.num_agents].copy()
+                    last_agent_world_pos[:,:,0] = last_agent_world_pos[:,:,0]/(self.map_size_cm//100)
+                    last_agent_world_pos[:,:,1] = last_agent_world_pos[:,:,1]/(self.map_size_cm//100)
+                    last_agent_world_pos[:,:,2] = 1
+                    last_agent_world_pos = np.concatenate((last_agent_world_pos,np.zeros((self.n_rollout_threads,self.num_agents,1))),axis = -1)
+                    for a in range(self.num_agents):
+                        self.global_input[key][:, a, (global_step-1)*self.num_agents:global_step*self.num_agents] = np.roll(last_agent_world_pos, -a, axis=1)
             elif key == 'graph_last_pos_mask':
-                for e in range(self.n_rollout_threads):
-                    if first_compute_in_run[e]:
-                        self.global_input[key][:,:, :self.num_agents] = 1
-                    else:
-                        self.global_input[key][:,:, :global_step[e]*self.num_agents] = 1
+                if self.first_compute:
+                    self.global_input[key][:,:, :(global_step+1)*self.num_agents] = 1
+                else:
+                    self.global_input[key][:,:, :global_step*self.num_agents] = 1
             else:
                 self.global_input[key] = np.array([infos[e][key] for e in range(self.n_rollout_threads)])
 
         for e in range(self.n_rollout_threads):
-            
-            if global_step[e] == self.episode_length:
+            if global_step == self.episode_length:
                 self.last_agent_world_pos[e, : self.num_agents] = infos[e]['world_position'].copy()
             else:
-                self.last_agent_world_pos[e, global_step[e]*self.num_agents:(global_step[e]+1)*self.num_agents] = infos[e]['world_position'].copy()
-          
+                self.last_agent_world_pos[e, global_step*self.num_agents:(global_step+1)*self.num_agents] = infos[e]['world_position'].copy()
+                 
         for key in self.global_input.keys():
             self.share_global_input[key] = self.global_input[key].copy()
-        self.first_compute_in_run = [False for _ in range(self.n_rollout_threads)]   
+         
         if self.visualize_input:
             self.visualize_obs(self.fig, self.ax, self.share_global_input)
-    
-   
+
     def compute_local_action(self):
         local_action = torch.empty(self.n_rollout_threads, self.num_agents)
         for a in range(self.num_agents):
@@ -1221,25 +968,6 @@ class GraphHabitatRunner(Runner):
 
         return local_action
     
-    def compute_each_local_action(self, e, a):
-        
-        local_goals = self.global_output[e:e+1, a]
-
-        if self.train_local:
-            torch.set_grad_enabled(True)
-    
-        action, action_prob, self.local_rnn_states[e:e+1, a] =\
-            self.local_policy(self.obs[e:e+1, a],
-                                self.local_rnn_states[e:e+1, a],
-                                self.local_masks[e:e+1, a],
-                                extras=local_goals)
-        if self.train_local:
-            action_target = check(self.global_output[:, a, -1]).to(self.device)
-            self.local_policy_loss += nn.CrossEntropyLoss()(action_prob, action_target)
-            torch.set_grad_enabled(False)
-        local_action = action.cpu()
-
-        return local_action.unsqueeze(-1)
 
     def rot_goals(self, e, global_goal):
         trans_goals = np.zeros((self.num_agents, 2), dtype = np.int32)
@@ -1251,7 +979,9 @@ class GraphHabitatRunner(Runner):
             else:  
                 goals[0] = global_goal[e, agent_id, 0]*(self.sim_map_size[e][agent_id][0]+10)+self.full_w/2-math.ceil(self.sim_map_size[e][agent_id][0]/2)-5  
                 goals[1] = global_goal[e, agent_id, 1]*(self.sim_map_size[e][agent_id][1]+10)+self.full_h/2-math.ceil(self.sim_map_size[e][agent_id][1]/2)-5
-           
+            if self.direction_goal:
+                goals[0] = int(global_goal[e, agent_id, 0] * self.full_w)
+                goals[1] = int(global_goal[e, agent_id, 1] * self.full_h)
             if self.add_ghost:
                 goals[0] = int(global_goal[e, agent_id, 1])
                 goals[1] = int(global_goal[e, agent_id, 0])
@@ -1306,6 +1036,9 @@ class GraphHabitatRunner(Runner):
                 else:  
                     goals[0] = self.global_goal[e, agent_id, 0]*(self.sim_map_size[e][agent_id][0]+10)+self.center_w-math.ceil(self.sim_map_size[e][agent_id][0]/2)-5  
                     goals[1] = self.global_goal[e, agent_id, 1]*(self.sim_map_size[e][agent_id][1]+10)+self.center_h-math.ceil(self.sim_map_size[e][agent_id][1]/2)-5
+                if self.direction_goal:
+                    goals[0] = int(self.global_goal[e, agent_id, 0] * self.full_w)
+                    goals[1] = int(self.global_goal[e, agent_id, 1] * self.full_h)
                 
                 goals = get_closest_frontier(merge_map[e], self.world_locs[e, agent_id], goals)
 
@@ -1315,24 +1048,31 @@ class GraphHabitatRunner(Runner):
                 else:
                     self.global_goal[e, agent_id, 0] = (goals[0] - (self.center_w-math.ceil(self.sim_map_size[e][agent_id][0]/2)-5)) / (self.sim_map_size[e][agent_id][0]+10)
                     self.global_goal[e, agent_id, 1] = (goals[1] - (self.center_h-math.ceil(self.sim_map_size[e][agent_id][1]/2)-5)) / (self.sim_map_size[e][agent_id][1]+10)
+                if self.direction_goal:
+                    self.global_goal[e, agent_id, 0] = goals[0] / self.full_w
+                    self.global_goal[e, agent_id, 1] = goals[1] / self.full_h
+                
                 self.global_goal[e, agent_id, 0] = max(0, min(1, self.global_goal[e, agent_id, 0]))
                 self.global_goal[e, agent_id, 1] = max(0, min(1, self.global_goal[e, agent_id, 1]))
 
     def compute_global_goal(self, step):        
         self.trainer.prep_rollout()
+
         concat_share_obs = {}
         concat_obs = {}
+
         for key in self.buffer.share_obs.keys():
             concat_share_obs[key] = np.concatenate(self.buffer.share_obs[key][step])
         for key in self.buffer.obs.keys():
             concat_obs[key] = np.concatenate(self.buffer.obs[key][step])
+        
         frontier_graph_data=[]
         agent_graph_data=[]
         if self.use_mgnn:
             for e in range(self.n_rollout_threads):
                 for _ in range(self.num_agents):
                     frontier_x = torch.zeros((self.num_agents, self.feature_dim))
-                    total_sum = self.num_agents              
+                    total_sum = self.num_agents               
                     frontier_edge_index = torch.stack((torch.tensor([i for i in range(total_sum)],dtype=torch.long).repeat(total_sum,1).t().reshape(-1),torch.tensor([i for i in range(total_sum)],dtype=torch.long).repeat(total_sum)) ).to(torch.device("cuda:0"))
                     frontier_graph_data.append(Data(x=frontier_x, edge_index=frontier_edge_index))   
                     agent_x = torch.zeros((self.num_agents, self.feature_dim))
@@ -1346,7 +1086,7 @@ class GraphHabitatRunner(Runner):
                             np.concatenate(self.buffer.rnn_states[step]),
                             np.concatenate(self.buffer.rnn_states_critic[step]),
                             np.concatenate(self.buffer.masks[step]),
-                            available_actions =   None,
+                            available_actions =  None,
                             available_actions_first = None, 
                             available_actions_second = None, 
                             rank = np.concatenate(self.buffer.rank[step]))
@@ -1370,14 +1110,15 @@ class GraphHabitatRunner(Runner):
                     temp_idx = 0
                     for idx in range(node_counts.shape[0]):
                         if temp_idx > self.global_goal[e,a]:
-                            temp_idx = idx - 1
+                            temp_idx = idx-1
                             break
                         else:
                             temp_idx += node_counts[idx]
                     self.node_goal[e,a] = self.global_input['graph_node_pos'][e,a,temp_idx,:2].copy()
+        if self.proj_frontier:
+            self.goal_to_frontier()
+
         return values, actions, action_log_probs, rnn_states, rnn_states_critic
-    
-    
     
     def eval_compute_global_goal(self, rnn_states):      
         self.trainer.prep_rollout()
@@ -1385,18 +1126,20 @@ class GraphHabitatRunner(Runner):
         concat_obs = {}
         for key in self.global_input.keys():
             concat_obs[key] = np.concatenate(self.global_input[key])
+        
         frontier_graph_data=[]
         agent_graph_data=[]
         if self.use_mgnn:
             for e in range(self.n_rollout_threads):
                 for _ in range(self.num_agents):
                     frontier_x= torch.zeros((self.num_agents, self.feature_dim))
-                    total_sum=self.num_agents             
+                    total_sum=self.num_agents 
                     frontier_edge_index = torch.stack((torch.tensor([i for i in range(total_sum)],dtype=torch.long).repeat(total_sum,1).t().reshape(-1),torch.tensor([i for i in range(total_sum)],dtype=torch.long).repeat(total_sum)) ).to(torch.device("cuda:0"))
                     frontier_graph_data.append(Data(x=frontier_x, edge_index=frontier_edge_index))   
                     agent_x = torch.zeros((self.num_agents, self.feature_dim))
                     agent_edge_index = torch.stack((torch.tensor([i for i in range(self.num_agents)],dtype=torch.long).repeat(self.num_agents,1).t().reshape(-1),torch.tensor([i for i in range(self.num_agents)],dtype=torch.long).repeat(self.num_agents)) ).to(torch.device("cuda:0"))
                     agent_graph_data.append(Data(x=agent_x, edge_index=agent_edge_index))     
+
         actions, rnn_states = self.trainer.policy.act(concat_obs,
                                     frontier_graph_data,
                                     agent_graph_data,
@@ -1406,23 +1149,49 @@ class GraphHabitatRunner(Runner):
                                     available_actions_first = None, 
                                     available_actions_second= None,
                                     deterministic=True)
-        
+            
         rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
 
         # Compute planner inputs
+        
         if self.use_mgnn:
             self.global_goal = np.array(np.split(_t2n(actions), self.n_rollout_threads))
         else:
             self.global_goal = np.array(np.split(_t2n(nn.Sigmoid()(actions)), self.n_rollout_threads))
+        
+        if self.use_double_matching:
+            for e in range(self.n_rollout_threads):
+                mask = self.global_input['graph_merge_ghost_mask'][e,0]
+                node_counts = np.sum(mask,axis=-1)
+                for a in range(self.num_agents):
+                    temp_idx = 0
+                    for idx in range(node_counts.shape[0]):
+                        if temp_idx > self.global_goal[e,a]:
+                            temp_idx = idx-1
+                            break
+                        else:
+                            temp_idx += node_counts[idx]
+                    self.node_goal[e,a] = self.global_input['graph_node_pos'][e,a,temp_idx,:2].copy()
+        if self.proj_frontier:
+            self.goal_to_frontier() 
         return rnn_states, actions
     
 
     def first_compute_global_input(self):
-        locs = self.local_pose 
-        self.merge_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
+        locs = self.local_pose
+        
+        if self.use_single:
+            self.single_merge_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
+            self.merge_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
+        else:
+            self.merge_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.full_w, self.full_h), dtype=np.float32)
+        
+        if self.use_merge_goal or self.use_goal:
+            global_goal_map = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.full_w, self.full_h), dtype=np.float32)
         if self.use_local:
             self.local_merge_map = np.zeros((self.n_rollout_threads, self.num_agents, 4, self.local_map_w, self.local_map_h), dtype=np.float32)
             self.local_single_map = np.zeros((self.n_rollout_threads, self.num_agents, 2, self.local_map_w, self.local_map_h), dtype=np.float32)
+       
         for a in range(self.num_agents):
             for e in range(self.n_rollout_threads):
                 r, c = locs[e, a, 1], locs[e, a, 0]
@@ -1430,10 +1199,19 @@ class GraphHabitatRunner(Runner):
                                 int(c * 100.0 / self.map_resolution)]
                                 
                 self.local_map[e, a, 2:, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1
-            self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
+                
+            if self.use_single:
+                self.single_merge_map[:, a] = self.single_transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
+                self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
+            else:
+                self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
             if self.use_local:
                 self.local_merge_map[:, a], self.local_single_map[:, a] = self.compute_local_merge(self.merge_map[:, a], self.agent_merge_map[:,a], a)
-       
+            if self.use_merge_goal:
+                global_goal_map[:, a] = self.point_transform(a)
+            if self.use_goal:
+                global_goal_map[:, a] = self.single_point_transform(a)
+
         for a in range(self.num_agents):
             map_agent_id = 1
             if self.use_centralized_V:
@@ -1442,31 +1220,38 @@ class GraphHabitatRunner(Runner):
                 for i in range(4):
                     if i > 1:
                         map_agent_id = 1
-                    if self.use_local:
-                        if self.use_seperated_cnn_model:
-                            self.global_input['local_merge_obs'][e, a, i] = cv2.resize(self.local_merge_map[e, a, i], (self.local_map_w, self.local_map_h))*map_agent_id
+                    if self.use_single:
+                        self.global_input['global_obs'][e, a, i] = cv2.resize(self.single_merge_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
+                                self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
+                                self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h)) * map_agent_id
+                        if self.use_single_merge and i<2:
                             self.global_input['global_merge_obs'][e, a, i] = cv2.resize(self.merge_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
                                 self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
-                                self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_map_w, self.local_map_h))*map_agent_id
-                        else:
+                                self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h)) * map_agent_id
+                        if self.use_goal and i<2:
+                            self.global_input['global_goal'][e, a, i] = cv2.resize(global_goal_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
+                                self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
+                                self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h))
+                    else:
+                        if self.use_local:
                             self.global_input['global_merge_obs'][e, a, i] = cv2.resize(self.local_merge_map[e, a, i], (self.local_map_w, self.local_map_h))*map_agent_id
                             self.global_input['global_merge_obs'][e, a, i+4] = cv2.resize(self.merge_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
                                 self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
                                 self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_map_w, self.local_map_h))*map_agent_id
-                        if self.use_merge_goal and i<2:
-                            self.global_input['global_merge_goal'][e, a, i] = cv2.resize(global_goal_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
-                            self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
-                            self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_map_w, self.local_map_h))
-                    else:   
-                        self.global_input['global_merge_obs'][e, a, i] = cv2.resize(self.merge_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
-                            self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
-                            self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h))*map_agent_id
-                    
-                        if self.use_merge_goal and i<2:
-                            self.global_input['global_merge_goal'][e, a, i] = cv2.resize(global_goal_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
-                            self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
-                            self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h))
-            
+                            if self.use_merge_goal and i<2:
+                                self.global_input['global_merge_goal'][e, a, i] = cv2.resize(global_goal_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
+                                self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
+                                self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_map_w, self.local_map_h))
+                        else:   
+                            self.global_input['global_merge_obs'][e, a, i] = cv2.resize(self.merge_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
+                                self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
+                                self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h))*map_agent_id
+                        
+                            if self.use_merge_goal and i<2:
+                                self.global_input['global_merge_goal'][e, a, i] = cv2.resize(global_goal_map[e, a, i, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
+                                self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
+                                self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h))
+                
                 if self.use_centralized_V:
                     if self.use_local:
                         self.share_global_input['gt_map'][e, a, 0] = cv2.resize(world_gt[e, 0, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
@@ -1476,42 +1261,51 @@ class GraphHabitatRunner(Runner):
                         self.share_global_input['gt_map'][e, a, 0] = cv2.resize(world_gt[e, 0, self.center_w-math.ceil(self.sim_map_size[e][a][0]/2)-5: \
                                 self.center_w+math.ceil(self.sim_map_size[e][a][0]/2)+5, \
                                 self.center_h-math.ceil(self.sim_map_size[e][a][1]/2)-5: self.center_h+math.ceil(self.sim_map_size[e][a][1]/2)+5], (self.local_w, self.local_h)) 
+        
         all_global_cnn_input = [[] for _ in range(self.num_agents)]
         for agent_id in range(self.num_agents):
             for key in self.global_input.keys():
                 if key not in ['stack_obs','global_orientation', 'vector','action_mask_obs','action_mask','grid_agent_id','grid_pos','grid_goal']:
                     all_global_cnn_input[agent_id].append(self.global_input[key][:, agent_id])
             all_global_cnn_input[agent_id] = np.concatenate(all_global_cnn_input[agent_id], axis=1) #[e,n,...]
+        
         all_global_cnn_input = np.stack(all_global_cnn_input, axis=1)
+        
         self.global_input['stack_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, all_global_cnn_input.shape[2] * self.num_agents, self.local_w, self.local_h), dtype=np.float32)
         self.share_global_input['stack_obs'] = np.zeros((self.n_rollout_threads, self.num_agents, all_global_cnn_input.shape[2] * self.num_agents, self.local_w, self.local_h), dtype=np.float32)
         for agent_id in range(self.num_agents):
             self.global_input['stack_obs'][:, agent_id] = all_global_cnn_input.reshape(self.n_rollout_threads, -1, *all_global_cnn_input.shape[3:]).copy()
+        
         for a in range(1, self.num_agents):
             self.global_input['stack_obs'][:, a] = np.roll(self.global_input['stack_obs'][:, a], -all_global_cnn_input.shape[2]*a, axis=1)
+
         for key in self.global_input.keys():
             self.share_global_input[key] = self.global_input[key].copy()
+        
         self.first_compute = False
-
+    
+   
     @torch.no_grad()
     def compute(self):
         self.trainer.prep_rollout()
         concat_share_obs = {}
         concat_obs = {}
+
         for key in self.buffer.share_obs.keys():
             concat_share_obs[key] = np.concatenate(self.buffer.share_obs[key][-1])
         for key in self.buffer.obs.keys():
             concat_obs[key] = np.concatenate(self.buffer.obs[key][-1])
+
         frontier_graph_data=[]
         agent_graph_data=[]
         if self.use_mgnn:
             for e in range(self.n_rollout_threads):
                 for _ in range(self.num_agents):
-                    frontier_x= torch.zeros((self.num_agents, self.feature_dim))
-                    total_sum=self.num_agents
+                    frontier_x= torch.zeros((self.num_agents, self.feature_dim))#torch.tensor(concat_obs['graph_merge_ghost_feature'][e*self.num_agents][concat_obs['graph_merge_ghost_mask'][e*self.num_agents]!=0],dtype=torch.float).to(torch.device("cuda:0"))
+                    total_sum=self.num_agents#int(concat_obs['graph_merge_ghost_mask'][e*self.num_agents].sum())
                     frontier_edge_index = torch.stack((torch.tensor([i for i in range(total_sum)],dtype=torch.long).repeat(total_sum,1).t().reshape(-1),torch.tensor([i for i in range(total_sum)],dtype=torch.long).repeat(total_sum)) ).to(torch.device("cuda:0"))
                     frontier_graph_data.append(Data(x=frontier_x, edge_index=frontier_edge_index))
-                    agent_x = torch.zeros((self.num_agents, self.feature_dim))
+                    agent_x = torch.zeros((self.num_agents, self.feature_dim))#torch.tensor(concat_obs['graph_curr_vis_embedding'][e*self.num_agents],dtype=torch.float).to(torch.device("cuda:0"))
                     agent_edge_index = torch.stack((torch.tensor([i for i in range(self.num_agents)],dtype=torch.long).repeat(self.num_agents,1).t().reshape(-1),torch.tensor([i for i in range(self.num_agents)],dtype=torch.long).repeat(self.num_agents)) ).to(torch.device("cuda:0"))
                     agent_graph_data.append(Data(x=agent_x, edge_index=agent_edge_index))
         next_values = self.trainer.policy.get_values(concat_share_obs,
@@ -1532,44 +1326,40 @@ class GraphHabitatRunner(Runner):
                 r, c = locs[e, a, 1], locs[e, a, 0]
                 loc_r, loc_c = [int(r * 100.0 / self.map_resolution),
                                 int(c * 100.0 / self.map_resolution)]
+
                 self.local_map[e, a, 2:, loc_r - 2:loc_r + 3, loc_c - 2:loc_c + 3] = 1
-          
+                if self.use_new_trace and self.use_weight_trace:
+                    self.local_map[e, a, 3] *= self.decay_weight
 
     def update_map_and_pose(self, update = True):
         for e in range(self.n_rollout_threads):
             for a in range(self.num_agents):
                 self.full_map[e, a, :, self.lmb[e, a, 0]:self.lmb[e, a, 1], self.lmb[e, a, 2]:self.lmb[e, a, 3]] = self.local_map[e, a]
                 if update:
+                    if self.use_new_trace:
+                        self.full_map[e, a, 3] = np.zeros((self.full_w, self.full_h), dtype=np.float32)
+                        self.full_map[e, a, 3, self.lmb[e, a, 0]:self.lmb[e, a, 1], self.lmb[e, a, 2]:self.lmb[e, a, 3]] = self.local_map[e, a, 3]
                     self.full_pose[e, a] = self.local_pose[e, a] + self.origins[e, a]
+
                     locs = self.full_pose[e, a]
                     r, c = locs[1], locs[0]
                     loc_r, loc_c = [int(r * 100.0 / self.map_resolution),
                                     int(c * 100.0 / self.map_resolution)]
+
                     self.lmb[e, a] = self.get_local_map_boundaries((loc_r, loc_c),
                                                         (self.local_w, self.local_h),
                                                         (self.full_w, self.full_h))
+
                     self.planner_pose_inputs[e, a, 3:] = self.lmb[e, a].copy()
                     self.origins[e, a] = [self.lmb[e, a][2] * self.map_resolution / 100.0,
                                     self.lmb[e, a][0] * self.map_resolution / 100.0, 0.]
+
                     self.local_map[e, a] = self.full_map[e, a, :, self.lmb[e, a, 0]:self.lmb[e, a, 1], self.lmb[e, a, 2]:self.lmb[e, a, 3]]
                     self.local_pose[e, a] = self.full_pose[e, a] - self.origins[e, a]
+                    if self.use_new_trace:
+                        self.local_map[e, a, 3] = np.zeros((self.local_w, self.local_h), dtype=np.float32)
     
-    def update_agent_map_and_pose(self, e, a):
-        self.full_map[e, a, :, self.lmb[e, a, 0]:self.lmb[e, a, 1], self.lmb[e, a, 2]:self.lmb[e, a, 3]] = self.local_map[e, a]
-        self.full_pose[e, a] = self.local_pose[e, a] + self.origins[e, a]
-        locs = self.full_pose[e, a]
-        r, c = locs[1], locs[0]
-        loc_r, loc_c = [int(r * 100.0 / self.map_resolution),
-                        int(c * 100.0 / self.map_resolution)]
-        self.lmb[e, a] = self.get_local_map_boundaries((loc_r, loc_c),
-                                            (self.local_w, self.local_h),
-                                            (self.full_w, self.full_h))
-        self.planner_pose_inputs[e, a, 3:] = self.lmb[e, a].copy()
-        self.origins[e, a] = [self.lmb[e, a][2] * self.map_resolution / 100.0,
-                        self.lmb[e, a][0] * self.map_resolution / 100.0, 0.]
-        self.local_map[e, a] = self.full_map[e, a, :, self.lmb[e, a, 0]:self.lmb[e, a, 1], self.lmb[e, a, 2]:self.lmb[e, a, 3]]
-        self.local_pose[e, a] = self.full_pose[e, a] - self.origins[e, a]
-    
+   
     def compute_path(self, frontiers, robots):
         path = []
         batch_size = frontiers.shape[0]
@@ -1613,76 +1403,29 @@ class GraphHabitatRunner(Runner):
             path.append(path_)
         return path
 
-    def reset_env_info(self, dones, infos):
-       
-        for e, done, info in zip(range(dones.shape[0]), dones, infos):
-            if np.all(done):
-                self.init_each_map_and_pose(e)
-                self.init_each_global_policy(e)
-                self.convert_each_info(e)
-                self.init_each_env_info(e)
-                self.first_compute_in_run[e] = True
-                self.global_step[e] = 0
-                del self.last_obs
-                self.last_obs = copy.deepcopy(self.obs)
-                self.trans[e] = info['trans']
-                self.rotation[e] = info['rotation'] 
-                self.agent_trans[e] = info['agent_trans'] 
-                self.agent_rotation[e] = info['agent_rotation'] 
-                self.explorable_map[e] = info['explorable_map'] 
-                self.scene_id[e] = info['scene_id'] 
-                self.sim_map_size[e] = info['sim_map_size'] 
-                self.add_node[e] = np.ones((self.num_agents))*False
-                self.add_node_flag[e] = np.ones((self.num_agents))*False
-                self.global_step[e] = 0
-                
-
-    def insert_global_policy(self, data):
-        dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic = data
     
-        for e in range(self.n_rollout_threads):
-            if self.use_ghost_goal_penalty:
-                if self.env_info['sum_merge_explored_ratio'][e]<0.9:
-                    for p_a in range(self.num_agents):
-                        p_a_x = self.global_goal_position[e, p_a, 0]
-                        p_a_y = self.global_goal_position[e, p_a, 1]
-                        for p_b in range(self.num_agents):
-                            if p_b != p_a:
-                                p_b_x = self.global_goal_position[e, p_b, 0]
-                                p_b_y = self.global_goal_position[e, p_b, 1]
-                                if math.sqrt((p_a_x - p_b_x)**2 + (p_a_y - p_b_y)**2) == 0:
-                                    pass
-                                else:
-                                    self.rewards[e, p_a] -= 1 / (math.sqrt((p_a_x - p_b_x)**2 + (p_a_y - p_b_y)**2)*10)
-
-        rnn_states[dones == True] = np.zeros(((dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
-        rnn_states_critic[dones == True] = np.zeros(((dones == True).sum(), *self.buffer.rnn_states_critic.shape[3:]), dtype=np.float32)
-        masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-        masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
-        if not self.use_centralized_V:
-            self.share_global_input = self.global_input.copy()
-        self.buffer.insert(self.share_global_input, self.global_input, rnn_states, rnn_states_critic, actions, action_log_probs, values, self.rewards, masks,\
-        available_actions= None, available_actions_first = None, available_actions_second = None)
-        self.global_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32) 
-        self.rewards = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32) 
     
     def compute_fmm_distance(self, positions):
         fmm_dis = self.envs.get_runner_fmm_distance(positions)
         return fmm_dis
 
     def ft_compute_global_goal(self, e):
-       
+        #print("apf {}".format(e))
         # ft_merge_map transform
         locations = self.update_ft_merge_map(e)
+        
         inputs = {
             'map_pred' : self.ft_merge_map[e,0],
             'exp_pred' : self.ft_merge_map[e,1],
             'locations' : locations
         }
         goal_mask = [self.ft_go_steps[e][agent_id]<15 for agent_id in range(self.num_agents)]
+
         num_choose = self.num_agents - sum(goal_mask)
         self.env_info['merge_global_goal_num'] += num_choose
+
         goals = self.ft_get_goal(inputs, goal_mask, pre_goals = self.ft_pre_goals[e], e=e)
+
         for agent_id in range(self.num_agents):
             if not goal_mask[agent_id] or 'utility' in self.all_args.algorithm_name:
                 self.ft_pre_goals[e][agent_id] = np.array(goals[agent_id], dtype=np.int32) # goals before rotation
@@ -1702,7 +1445,8 @@ class GraphHabitatRunner(Runner):
             output[0, 0, goals[agent_id][0]-1 : goals[agent_id][0]+2, goals[agent_id][1]-1:goals[agent_id][1]+2] = 1
             agent_n_trans = F.grid_sample(torch.from_numpy(output).float(), self.agent_trans[e][agent_id].float(), align_corners = True)
             map = F.grid_sample(agent_n_trans.float(), self.agent_rotation[e][agent_id].float(), align_corners = True)[0, 0, :, :].numpy()
-            (index_a, index_b) = np.unravel_index(np.argmax(map[ :, :], axis=None), map[ :, :].shape) 
+
+            (index_a, index_b) = np.unravel_index(np.argmax(map[ :, :], axis=None), map[ :, :].shape) # might be wrong!!
             ft_goals[agent_id] = np.array([index_a, index_b], dtype = np.float32)
         return ft_goals
     
@@ -1711,6 +1455,7 @@ class GraphHabitatRunner(Runner):
 
     def ft_compute_local_input(self):
         self.local_input = []
+
         for e in range(self.n_rollout_threads):
             p_input = defaultdict(list)
             for a in range(self.num_agents):
@@ -1737,6 +1482,7 @@ class GraphHabitatRunner(Runner):
             n_rotated = F.grid_sample(output.unsqueeze(0).float(), self.rotation[e][agent_id].float(), align_corners=True)
             n_map = F.grid_sample(n_rotated.float(), self.trans[e][agent_id].float(), align_corners = True)
             agent_merge_map = n_map[0, :, :, :].numpy()
+
             (index_a, index_b) = np.unravel_index(np.argmax(agent_merge_map[2, :, :], axis=None), agent_merge_map[2, :, :].shape) # might be inaccurate !!        
             self.ft_merge_map[e] += agent_merge_map[:2]
             locations.append((index_a, index_b))
@@ -1747,19 +1493,16 @@ class GraphHabitatRunner(Runner):
         
         return locations
     
-    def ft_get_goal(self, inputs, goal_mask, pre_goals = None, e=None, training=False):
+    def ft_get_goal(self, inputs, goal_mask, pre_goals = None, e=None):
         obstacle = inputs['map_pred']
         explored = inputs['exp_pred']
         locations = inputs['locations']
 
         if all(goal_mask):
-            if training:
-                return pre_goals
-            else:
-                goals = []
-                for agent_id in range(self.num_agents):
-                    goals.append((self.ft_pre_goals[e,agent_id][0], self.ft_pre_goals[e, agent_id][1]))
-                return goals
+            goals = []
+            for agent_id in range(self.num_agents):
+                goals.append((self.ft_pre_goals[e,agent_id][0], self.ft_pre_goals[e, agent_id][1]))
+            return goals
 
         obstacle = np.rint(obstacle).astype(np.int32)
         explored = np.rint(explored).astype(np.int32)
@@ -1800,16 +1543,9 @@ class GraphHabitatRunner(Runner):
                     goal = nearest_frontier(map, unexplored, locations, steps, agent_id, clear_radius = self.all_args.ft_clear_radius, cluster_radius = self.all_args.ft_cluster_radius, random_goal=self.all_args.ft_use_random)
                 elif self.all_args.algorithm_name == 'ft_rrt':
                     goal = rrt_global_plan(map, unexplored, locations, agent_id, clear_radius = self.all_args.ft_clear_radius, cluster_radius = self.all_args.ft_cluster_radius, step = self.env_step, utility_radius = self.all_args.utility_radius, random_goal=self.all_args.ft_use_random)
-                elif training:
-                    goal = nearest_frontier(map, unexplored, locations, steps, agent_id, clear_radius = 40, cluster_radius = self.all_args.ft_cluster_radius, random_goal=False, training=True)
                 else:
                     raise NotImplementedError
-                if training:
-                    for i in range(len(goal)):
-                        goal[i] = (goal[i][0]+lx, goal[i][1]+ly)
-                    goals.append(goal)
-                else:
-                    goals.append((goal[0] + lx, goal[1] + ly))
+                goals.append((goal[0] + lx, goal[1] + ly))
 
         return goals
 
@@ -1863,6 +1599,7 @@ class GraphHabitatRunner(Runner):
     def train_global_policy(self):
         self.compute()
         train_global_infos = self.train()
+        
         for k, v in train_global_infos.items():
             self.train_global_infos[k].append(v)
 
@@ -1898,21 +1635,19 @@ class GraphHabitatRunner(Runner):
         for k, v in env_infos.items():
             if len(v) > 0:
                 if self.use_wandb:
-                    wandb.log({k: np.nanmean(v) if k == "merge_explored_ratio_step" or k == "merge_explored_ratio_step_0.95" else np.mean(v)}, step=total_num_steps)
+                    if k == 'auc':
+                        for i in range(self.max_episode_length):
+                            wandb.log({k: np.mean(v[:,:,i])}, step=i+1)
+                    else:
+                        wandb.log({k: np.nanmean(v) if k == "merge_explored_ratio_step" or k == "merge_explored_ratio_step_0.95" else np.mean(v)}, step=total_num_steps)
                 else:
-                    self.writter.add_scalars(k, {k: np.nanmean(v) if k == "merge_explored_ratio_step" or k == "merge_explored_ratio_step_0.95" else np.mean(v)}, total_num_steps)
+                    if k == 'auc':
+                        for i in range(self.max_episode_length):
+                            self.writter.add_scalars(k, {k: np.mean(v[:,:,i])}, i+1)
+                    else:
+                        self.writter.add_scalars(k, {k: np.nanmean(v) if k == "merge_explored_ratio_step" or k == "merge_explored_ratio_step_0.95" else np.mean(v)}, total_num_steps)
 
     def log_agent(self, train_infos, total_num_steps):
-        for k, v in train_infos.items():
-            if "merge" not in k:
-                for agent_id in range(self.num_agents):
-                    agent_k = "agent{}_".format(agent_id) + k
-                    if self.use_wandb:
-                        wandb.log({agent_k: np.mean(np.array(v)[:,:,agent_id])}, step=total_num_steps)
-                    else:
-                        self.writter.add_scalars(agent_k, {agent_k: np.mean(np.array(v)[:,:,agent_id])}, total_num_steps)
-    
-    def log_async_agent(self, train_infos, total_num_steps):
         for k, v in train_infos.items():
             if "merge" not in k:
                 for agent_id in range(self.num_agents):
@@ -1923,9 +1658,9 @@ class GraphHabitatRunner(Runner):
                     else:
                         agent_k = "agent{}_".format(agent_id) + k
                     if self.use_wandb:
-                        wandb.log({agent_k: np.mean(np.array(v)[:,agent_id])}, step=total_num_steps)
+                        wandb.log({agent_k: np.mean(np.array(v)[:,:,agent_id])}, step=total_num_steps)
                     else:
-                        self.writter.add_scalars(agent_k, {agent_k: np.mean(np.array(v)[:,agent_id])}, total_num_steps)
+                        self.writter.add_scalars(agent_k, {agent_k: np.mean(np.array(v)[:,:,agent_id])}, total_num_steps)
     
     def log_single_env(self, env_infos, total_num_steps):
         for k, v in env_infos.items():
@@ -1940,12 +1675,14 @@ class GraphHabitatRunner(Runner):
     
     def render_gifs(self):
         gif_dir = str(self.run_dir / 'gifs')
+
         folders = []
         get_folders(gif_dir, folders)
         filer_folders = [folder for folder in folders if "all" in folder or "merge" in folder]
 
         for folder in filer_folders:
             image_names = sorted(os.listdir(folder))
+
             frames = []
             for image_name in image_names:
                 if image_name.split('.')[-1] == "gif":
@@ -1953,6 +1690,7 @@ class GraphHabitatRunner(Runner):
                 image_path = os.path.join(folder, image_name)
                 frame = imageio.imread(image_path)
                 frames.append(frame)
+
             imageio.mimsave(str(folder) + '/render.gif', frames, duration=self.all_args.ifi)
     
     def visualize_obs(self, fig, ax, obs):
@@ -1970,7 +1708,7 @@ class GraphHabitatRunner(Runner):
                 elif agent_id >= self.num_agents and i<4:
                     sub_ax[i].imshow(obs["global_obs"][0, agent_id-self.num_agents,i])
         plt.gcf().canvas.flush_events()
-        
+        # plt.pause(0.1)
         fig.canvas.start_event_loop(0.001)
         plt.gcf().canvas.flush_events()
     
@@ -1983,7 +1721,7 @@ class GraphHabitatRunner(Runner):
             # store each episode ratio or reward
             self.init_env_info()
             self.env_step = 0
-            
+           
             rnn_states = np.zeros((self.n_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
             actions_env = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
             self.add_node = np.ones((self.n_rollout_threads,self.num_agents))*False
@@ -1995,6 +1733,7 @@ class GraphHabitatRunner(Runner):
             self.obs, env_infos = self.envs.reset(reset_choose)
             add_infos = self.embed_obs(env_infos)
             infos = self.envs.update_merge_graph(add_infos)
+
             self.trans = [infos[e]['trans'] for e in range(self.n_rollout_threads)]
             self.rotation = [infos[e]['rotation'] for e in range(self.n_rollout_threads)]
             self.scene_id = [infos[e]['scene_id'] for e in range(self.n_rollout_threads)]
@@ -2002,17 +1741,22 @@ class GraphHabitatRunner(Runner):
             self.agent_rotation = [infos[e]['agent_rotation'] for e in range(self.n_rollout_threads)]
             self.explorable_map = np.array([infos[e]['explorable_map'] for e in range(self.n_rollout_threads)])
             self.sim_map_size = np.array([infos[e]['sim_map_size'] for e in range(self.n_rollout_threads)])
+            self.empty_map = np.array([infos[e]['empty_map'] for e in range(self.n_rollout_threads)])
             self.goal = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.int32)
             self.global_goal_position = np.zeros((self.n_rollout_threads, self.num_agents, 2), dtype=np.int32)
             self.agent_cur_loc = np.array([infos[e]['world_position'] for e in range(self.n_rollout_threads)])
+           
             # Predict map from frame 1:
             self.run_slam_module(self.obs, self.obs, infos)
+
             # Compute Global policy input
             self.first_compute = True
-            if self.learn_to_build_graph or self.use_frontier_nodes:
+            if self.learn_to_build_graph:
                 self.compute_graph_input(infos,0)
+
             # Compute Global goal
             rnn_states, actions = self.eval_compute_global_goal(rnn_states)
+
             # compute local input
             for a in range(self.num_agents):
                 if self.use_local_single_map:
@@ -2021,6 +1765,7 @@ class GraphHabitatRunner(Runner):
                     self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)   
             self.goal = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.int32)
             self.first_compute = False
+           
             if self.add_ghost:
                 if self.learn_to_build_graph:
                     node_max_num = self.envs.node_max_num()
@@ -2030,27 +1775,24 @@ class GraphHabitatRunner(Runner):
                             self.goal[e] = self.global_goal[e]
                         else:
                             node_idx.append(self.global_goal[e] * node_max_num[e])
-                    if not  self.use_mgnn:
+                    if not self.use_mgnn:
                         self.goal = self.envs.get_valid_num(node_idx)
-                    if self.use_frontier:
-                        self.goal = self.envs.get_graph_frontier()
+                    
                     if self.use_global_goal:
-                        self.global_goal_position, self.valid_ghost_position,_ = self.envs.get_goal_position(self.goal)
+                        self.global_goal_position, self.valid_ghost_position, self.valid_ghost_single_position = self.envs.get_goal_position(self.goal)
                         self.global_goal_position = self.global_goal_position[:,:,0]
                     else:
                         self.global_goal_position, self.has_node = self.envs.get_graph_waypoint(self.goal)
                     self.add_ghost_flag = np.ones((self.valid_ghost_position.shape[0],self.valid_ghost_position.shape[1]))*False
-            if self.use_frontier_nodes:
-                for e in range(self.n_rollout_threads):
-                    for agent_id in range(self.num_agents):
-                        self.global_goal_position[e,agent_id,0] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],1]
-                        self.global_goal_position[e,agent_id,1] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],0]
+            
             if self.use_local_single_map:
                 self.compute_local_input(self.single_merge_map)
             else:
                 self.compute_local_input(self.merge_map)
+
             self.global_output = self.envs.get_short_term_goal(self.global_insert)
             self.global_output = np.array(self.global_output, dtype = np.long)
+
             for step in range(self.max_episode_length):
                 self.env_step = step
                 if step % 15  == 0:
@@ -2058,16 +1800,20 @@ class GraphHabitatRunner(Runner):
                 local_step = step % self.num_local_steps
                 global_step = (step // self.num_local_steps) % self.episode_length
                 eval_global_step = step // self.num_local_steps + 1
+
                 self.last_obs = copy.deepcopy(self.obs)
+
                 # Sample actions
-                if self.learn_to_build_graph or self.use_frontier_nodes:
-                    actions_env = self.compute_local_action()    
+                if self.learn_to_build_graph:
+                    actions_env = self.compute_local_action()
+                              
                 # Obser reward and next obs
                 else:
                     actions_env = np.copy(actions[:,:,local_step:local_step+1].reshape(self.n_rollout_threads, self.num_agents))    
 
                 # Obser reward and next obs
                 self.obs, _, dones, env_infos = self.envs.step(actions_env)
+                
                 self.agent_cur_loc = np.array([env_infos[e]['world_position'] for e in range(self.n_rollout_threads)])
                 if self.add_ghost:
                     for e in range(self.n_rollout_threads):
@@ -2101,8 +1847,10 @@ class GraphHabitatRunner(Runner):
                     else:
                         add_infos[e]['update'] = False
                     add_infos[e]['add_node'] = self.add_node[e]
+
                 infos, reward = self.envs.update_merge_step_graph(add_infos)
                 self.add_node = np.ones((self.n_rollout_threads,self.num_agents))*False
+                
                 for e in range(self.n_rollout_threads):
                     for key in self.sum_env_info_keys:
                         if key in infos[e].keys():
@@ -2113,6 +1861,12 @@ class GraphHabitatRunner(Runner):
                                 agent_k = "agent{}_{}".format(agent_id, key)
                                 if agent_k in infos[e].keys():
                                     self.env_info[key][e][agent_id] = infos[e][agent_k]
+                        elif key == 'balanced_ratio':
+                            for agent_id in range(self.num_agents):
+                                for a in range(self.num_agents):
+                                    agent_k = "agent{}/{}_{}".format(agent_id, a, key)
+                                    if agent_k in infos[e].keys():
+                                        self.env_info[key][e][agent_id] = infos[e][agent_k] 
                         else:
                             if key in infos[e].keys():
                                 self.env_info[key][e] = infos[e][key]
@@ -2128,50 +1882,50 @@ class GraphHabitatRunner(Runner):
                             
                 self.local_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
                 self.local_masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+
                 self.global_masks *= self.local_masks
+
                 self.run_slam_module(self.last_obs, self.obs, infos)
                 self.update_local_map()
                 self.update_map_and_pose(False)
-                if self.add_ghost or self.use_frontier_nodes:
+                if self.add_ghost:
                     for a in range(self.num_agents):
                         if self.use_local_single_map:
                             self.single_merge_map[:, a] = self.single_transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
                         else:
                             self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)   
+                
+                
                 # Global Policy
                 if local_step == self.num_local_steps - 1:
                     # For every global step, update the full and local maps
                     self.add_node_flag = np.ones((self.n_rollout_threads,self.num_agents))*False
                     self.global_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
                     self.update_map_and_pose()
-                    if self.learn_to_build_graph or self.use_frontier_nodes:
+                    if self.learn_to_build_graph:
                         self.compute_graph_input(infos, global_step+1)
                         # Compute Global goal
                         rnn_states, actions = self.eval_compute_global_goal(rnn_states)                        
+
                     self.env_info['merge_global_goal_num'] += self.num_agents
-                    if self.use_frontier_nodes:
-                        for e in range(self.n_rollout_threads):
-                            for agent_id in range(self.num_agents):
-                                self.global_goal_position[e,agent_id,0] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],1]
-                                self.global_goal_position[e,agent_id,1] = np.array(infos[e]['frontier_loc'])[self.global_goal[e,agent_id],0]
-                    elif self.learn_to_build_graph:
+                
+                    if self.learn_to_build_graph:
                         node_max_num = self.envs.node_max_num()
                         node_idx = []
                         for e in range(self.n_rollout_threads):
-                            if  self.use_mgnn:
+                            if self.use_mgnn:
                                 self.goal[e] = self.global_goal[e]
                             else:
                                 node_idx.append(self.global_goal[e] * node_max_num[e])
                         if not self.use_mgnn:
                             self.goal = self.envs.get_valid_num(node_idx)
-                        if self.use_frontier:
-                            self.goal = self.envs.get_graph_frontier()
                         if self.use_global_goal:
-                            self.global_goal_position, self.valid_ghost_position,_ = self.envs.get_goal_position(self.goal)
+                            self.global_goal_position, self.valid_ghost_position, self.valid_ghost_single_position = self.envs.get_goal_position(self.goal)
                             self.global_goal_position = self.global_goal_position[:,:,0]
                         else:
                             self.global_goal_position, self.has_node = self.envs.get_graph_waypoint(self.goal)
                         self.add_ghost_flag = np.ones((self.valid_ghost_position.shape[0],self.valid_ghost_position.shape[1]))*False
+                    
                 if self.use_local_single_map:
                     self.compute_local_input(self.single_merge_map)
                 else:
@@ -2180,7 +1934,7 @@ class GraphHabitatRunner(Runner):
                 self.global_output = self.envs.get_short_term_goal(self.global_insert)
                 self.global_output = np.array(self.global_output, dtype = np.long)
         
-            #self.convert_info()
+            self.convert_info()
             total_num_steps = (episode + 1) * self.max_episode_length * self.n_rollout_threads
             if not self.use_render :
                 end = time.time()
@@ -2191,20 +1945,26 @@ class GraphHabitatRunner(Runner):
             
         for k, v in self.env_infos.items():
             print("eval average {}: {}".format(k, np.nanmean(v) if k == 'merge_explored_ratio_step' or k == "merge_explored_ratio_step_0.95"else np.mean(v)))
+
         if self.all_args.save_gifs:
             print("generating gifs....")
             self.render_gifs()
             print("done!")
+
+   
     
     @torch.no_grad()
     def eval_ft(self):
         self.eval_infos = defaultdict(list)
+        
         for episode in range(self.all_args.eval_episodes):
             start = time.time()
             # store each episode ratio or reward
             self.init_env_info()
             self.env_step = 0
-         
+            if not self.use_delta_reward:
+                self.rewards = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32) 
+
             rnn_states = np.zeros((self.n_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
 
             # init map and pose 
@@ -2222,20 +1982,31 @@ class GraphHabitatRunner(Runner):
             self.agent_rotation = [infos[e]['agent_rotation'] for e in range(self.n_rollout_threads)]
             self.explorable_map = np.array([infos[e]['explorable_map'] for e in range(self.n_rollout_threads)])
             self.sim_map_size = np.array([infos[e]['sim_map_size'] for e in range(self.n_rollout_threads)])
-         
+            self.empty_map = np.array([infos[e]['empty_map'] for e in range(self.n_rollout_threads)])
+            if self.action_mask:
+                self.global_input['action_mask_obs'] = np.ones((self.n_rollout_threads, self.num_agents, 1, self.grid_size, self.grid_size), dtype=np.int32)
+                self.global_input['action_mask'] = np.ones((self.n_rollout_threads, self.num_agents, 1, self.grid_size, self.grid_size), dtype=np.int32)
+
             # Predict map from frame 1:
             self.run_slam_module(self.obs, self.obs, infos)
+
             # Compute Global policy input
             self.first_compute = True
             self.first_compute_global_input()
+
             # Compute Global goal
             for e in range(self.n_rollout_threads):
                 self.ft_compute_global_goal(e)
+
             # compute local input
+
             self.ft_compute_local_input()
+
             # Output stores local goals as well as the the ground-truth action
             self.global_output = self.envs.get_short_term_goal(self.local_input)
             self.global_output = np.array(self.global_output, dtype = np.compat.long)
+            auc_area = np.zeros((self.n_rollout_threads, self.max_episode_length), dtype=np.float32)
+            auc_single_area = np.zeros((self.n_rollout_threads, self.num_agents, self.max_episode_length), dtype=np.float32)
             for step in range(self.max_episode_length):
                 self.env_step = step
                 if step % 15 == 0:
@@ -2245,50 +2016,78 @@ class GraphHabitatRunner(Runner):
                 eval_global_step = step // self.num_local_steps + 1
 
                 self.last_obs = copy.deepcopy(self.obs)
+
                 # Sample actions
                 actions_env = self.compute_local_action()
+
                 # Obser reward and next obs
+               
                 self.obs, reward, dones, env_infos = self.envs.step(actions_env)
                 add_infos = self.embed_obs(env_infos)
                 infos = self.envs.update_merge_graph(add_infos)
+
                 for e in range(self.n_rollout_threads):
                     for key in self.sum_env_info_keys:
                         if key in infos[e].keys():
                             self.env_info['sum_{}'.format(key)][e] += np.array(infos[e][key])
+                            if key == 'merge_explored_ratio' and self.use_eval:
+                                self.auc_infos['merge_auc'][episode, e, step] = self.auc_infos['merge_auc'][episode, e, step-1] + np.array(infos[e][key])
+                                auc_area[e, step] = auc_area[e, step-1] + np.array(infos[e][key])
+                            if key == 'explored_ratio' and self.use_eval:
+                                self.auc_infos['agent_auc'][episode, e, :, step] = self.auc_infos['agent_auc'][episode, e, :, step-1] + np.array(infos[e][key])
+                                auc_single_area[e, :, step] = auc_single_area[e, :, step-1] + np.array(infos[e][key])
                     for key in self.equal_env_info_keys:
                         if key == 'explored_ratio_step':
                             for agent_id in range(self.num_agents):
                                 agent_k = "agent{}_{}".format(agent_id, key)
                                 if agent_k in infos[e].keys():
                                     self.env_info[key][e][agent_id] = infos[e][agent_k]
+                        elif key == 'balanced_ratio':
+                            for agent_id in range(self.num_agents):
+                                for a in range(self.num_agents):
+                                    agent_k = "agent{}/{}_{}".format(agent_id, a, key)
+                                    if agent_k in infos[e].keys():
+                                        self.env_info[key][e][agent_id] = infos[e][agent_k] 
                         else:
                             if key in infos[e].keys():
                                 self.env_info[key][e] = infos[e][key]
                     if self.env_info['sum_merge_explored_ratio'][e] <= self.all_args.explored_ratio_down_threshold:
                         self.env_info['merge_global_goal_num_%.2f'%self.all_args.explored_ratio_down_threshold][e] = self.env_info['merge_global_goal_num'][e]
+                    
                     if self.num_agents==1:
                         if step in [49, 99, 149, 199, 249, 299, 349, 399, 449]:
+                            self.env_info[str(step+1)+'step_merge_auc'][e] = auc_area[e, :step+1].sum().copy()
+                            self.env_info[str(step+1)+'step_auc'][e] = auc_single_area[e, :, :step+1].sum(axis = 1)
                             self.env_info[str(step+1)+'step_merge_overlap_ratio'][e] = infos[e]['overlap_ratio']
                     else:
                         if step in [49, 99, 119, 149, 179, 199, 249, 299]:
+                            self.env_info[str(step+1)+'step_merge_auc'][e] = auc_area[e, :step+1].sum().copy()
+                            self.env_info[str(step+1)+'step_auc'][e] = auc_single_area[e, :, :step+1].sum(axis = 1)
                             self.env_info[str(step+1)+'step_merge_overlap_ratio'][e] = infos[e]['overlap_ratio'] 
-                          
+                
+                                
                 self.local_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
                 self.local_masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+
                 self.global_masks *= self.local_masks
+
                 self.run_slam_module(self.last_obs, self.obs, infos)
                 self.update_local_map()
                 self.update_map_and_pose()
+
                 for a in range(self.num_agents):
                     self.merge_map[:, a] = self.transform(self.full_map, self.trans, self.rotation, self.agent_trans, self.agent_rotation, a)
                     
                 # Global Policy
                 self.ft_go_steps += 1
+
                 for e in range (self.n_rollout_threads):
                     self.ft_last_merge_explored_ratio[e] = self.env_info['sum_merge_explored_ratio'][e]
                     self.ft_compute_global_goal(e) 
+                        
                 # Local Policy
                 self.ft_compute_local_input()
+
                 # Output stores local goals as well as the the ground-truth action
                 self.global_output = self.envs.get_short_term_goal(self.local_input)
                 self.global_output = np.array(self.global_output, dtype = np.compat.long)
@@ -2310,52 +2109,7 @@ class GraphHabitatRunner(Runner):
             self.render_gifs()
             print("done!")
             
-    
-    def compute_frontier_path(self, frontier, robots, counts):
-        batch_size = frontier.shape[0]
-        path = []
-        for batch in range(batch_size):
-            goals = []
-            cluster = KMeans(n_clusters=6*self.num_agents).fit(frontier[batch,:counts[batch]])
-            goals.append(cluster.cluster_centers_)
-            goals = np.array(goals)[0]
-            labels = self.omt(goals, robots[batch])
-            path_ = []
-            for i in range(self.num_agents):
-                pos = goals[labels==i]
-                dis_mat = np.zeros((pos.shape[0]+1, pos.shape[0]+1))
-                for xidx in range(pos.shape[0]+1):
-                    for yidx in range(pos.shape[0]+1):
-                        xpos = pos[xidx] if xidx < pos.shape[0] else robots[batch, i]
-                        ypos = pos[yidx] if yidx < pos.shape[0] else robots[batch, i]
-                        dis_temp = (xpos-ypos)**2
-                        dis_temp = math.sqrt(dis_temp[0]+dis_temp[1])
-                        dis_mat[xidx, yidx] = dis_temp
-                r = range(len(dis_mat))
-                max_idx = np.argmax(dis_mat[-1])
-                for j in r:
-                    if j != max_idx and j != len(dis_mat)-1:
-                        dis_mat[max_idx,j] = 100000
-                dist = {(i,j):dis_mat[i,j] for i in r for j in r}
-                temp_path = tsp.tsp(r,dist)[1]
-                temp_idx = []
-                start = False
-                for j in range(len(dis_mat)*2):
-                    j = j%len(dis_mat)
-                    if not start and temp_path[j] == len(dis_mat) - 1:
-                        start = True
-                        temp_idx.append(temp_path[j])
-                    elif start and temp_path[j] == len(dis_mat) - 1:
-                        break
-                    elif start and temp_path[j] != len(dis_mat) - 1:
-                        temp_idx.append(temp_path[j])
-                temp_path_ = []
-                for temp_id in range(1,len(temp_idx)):
-                    temp_path_.append(pos[temp_idx[temp_id]])
-                temp_path_.reverse()
-                path_.append(temp_path_)
-            path.append(path_)
-        return path
+  
 
     def omt(self, frontier, robots):
         def l2(x1, x2):
@@ -2363,16 +2117,23 @@ class GraphHabitatRunner(Runner):
             dis = math.sqrt(dis[0]+dis[1])
             return dis
         init_ = [robots[i] for i in range(robots.shape[0])]
-        capacity = 6
+        capacity = 12
         iters = 0
+        last_label = None
         while True:
             iters+=1
             cluster = KMeans(n_clusters=len(init_), init=np.array(init_)).fit(frontier)
             centers = cluster.cluster_centers_
             labels = cluster.labels_
             stop = True
-            for i in range(len(init_)):
+            for i in range(self.num_agents):
                 idx = np.where(labels==i)[0]
+                if len(idx) == 0:
+                    if last_label is not None:
+                        return last_label
+                    else:
+                        temp_labels = [0]*len(labels)
+                        temp_labels[:self.num_agents] = range(self.num_agents)
                 if len(idx) > capacity:
                     stop = False
                     max_dis = -math.inf
@@ -2383,39 +2144,39 @@ class GraphHabitatRunner(Runner):
                             max_idx = idx_
                     init_.append(frontier[max_idx])
                 for idx_ in idx:
-                    if l2(frontier[idx_], centers[i]) > 2.0*100/5:
+                    if l2(frontier[idx_], centers[i]) > 8.0*100/5:
                         init_.append(frontier[idx_])
                         stop = False
+            last_label = labels
             if stop:
                 break
         return labels
     
-    def compute_frontiers_ft(self, e):
-        locations = self.update_ft_merge_map(e)
-        
-        inputs = {
-            'map_pred' : self.ft_merge_map[e,0],
-            'exp_pred' : self.ft_merge_map[e,1],
-            'locations' : locations
-        }
-        goal_mask = [self.ft_go_steps[e][agent_id]<15 for agent_id in range(self.num_agents)]
-        goals = self.ft_get_goal(inputs, goal_mask, pre_goals = self.ft_training_pre[e], e=e, training=True)
+    def compute_mtsp(self, frontier_pos, agent_pos):
+        frontier_pos = frontier_pos[:,[1,0]]
+        agent_pos = agent_pos[:,[1,0]]
+        if frontier_pos.shape[0] >= 15*self.num_agents:
+            _, centers = compute_kmeans(frontier_pos[:, :2], 15*self.num_agents)
+        else:
+            centers = frontier_pos[:, :2]
+        selected_data, _ = compute_kmeans(centers, self.num_agents, agent_pos[:, :2])
+        availabel_id = None
+        for agent_id in range(agent_pos.shape[0]):
+            if not(len(selected_data[agent_id]) == 0):
+                availabel_id = agent_id
+                break
+        for agent_id in range(agent_pos.shape[0]):
+            if len(selected_data[agent_id]) == 0:
+                if availabel_id == None:
+                    raise NotImplementedError
+                else:
+                    selected_data[agent_id] = selected_data[availabel_id]
+        path = []
         for agent_id in range(self.num_agents):
-            if not goal_mask[agent_id]:
-                self.ft_training_pre[e][agent_id] = goals[agent_id]
-            self.ft_training[e][agent_id] = goals[agent_id]
-        
-
-    def ft_pooling(self, goals, pool=15):
-        ans = []
-        map = np.zeros((self.full_h, self.full_w))
-        for g in goals:
-            if map[g[0], g[1]] == 1:
-                continue
-            map[g[0]-pool:g[0]+pool, g[1]-pool:g[1]+pool] = 1
-            ans.append([g[0], g[1], 1])
-        if len(ans) >= self.max_frontier:
-            idx = np.random.choice(range(len(ans)), self.max_frontier, replace=False)
-            ans = ans[idx]
-            ic('random choice')
-        return ans
+            path = compute_frontier_plan(selected_data[agent_id])
+            selected_data[agent_id] = np.flipud(selected_data[agent_id][path].astype(int))
+            temp = []
+            for i in range(selected_data[agent_id].shape[0]):
+                temp.append(selected_data[agent_id][i])
+            selected_data[agent_id] = temp
+        return [selected_data] 

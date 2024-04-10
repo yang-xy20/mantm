@@ -98,11 +98,9 @@ class Flatten(nn.Module):
         return x.reshape(x.size(0), -1)
 
 class MLPAttention(nn.Module):
-    def __init__(self, desc_dim, use_submap, node_layer=False, matching_type=None):
+    def __init__(self, desc_dim, node_layer=False, matching_type=None):
         super().__init__()
-        if use_submap:
-            self.mlp = MLP([desc_dim * 2 + 32, desc_dim, 1])
-        elif matching_type == 'concat':
+        if matching_type == 'concat':
             self.mlp = MLP([desc_dim * 4, desc_dim, 1])
         elif node_layer:
             self.mlp = MLP([desc_dim * 3, desc_dim, desc_dim])
@@ -183,9 +181,9 @@ class MultiHeadedAttention(nn.Module):
         return self.merge(x.contiguous().view(batch, self.dim*self.num_heads, -1)), scores.mean(1)
 
 class AttentionalPropagation(nn.Module):
-    def __init__(self, feature_dim: int, num_heads: int, use_submap: bool, type: str, matching_type=None, node_layer=False):
+    def __init__(self, feature_dim: int, num_heads: int, type: str, matching_type=None, node_layer=False):
         super().__init__()
-        self.attn = MLPAttention(feature_dim, use_submap, node_layer, matching_type) if type == 'cross' else MultiHeadedAttention(num_heads, feature_dim)
+        self.attn = MLPAttention(feature_dim, node_layer, matching_type) if type == 'cross' else MultiHeadedAttention(num_heads, feature_dim)
         self.mlp = MLP([feature_dim*2, feature_dim*2, feature_dim])
         nn.init.constant_(self.mlp[-1].bias, 0.0)
         self.node_layer = node_layer
@@ -200,18 +198,18 @@ class AttentionalPropagation(nn.Module):
         return self.mlp(torch.cat([x, message], dim=1)), weights
 
 class AttentionalGNN(nn.Module):
-    def __init__(self, feature_dim: int, layer_names: list, use_submap: bool, matching_type=None, use_double_matching=False, node_layer=False):
+    def __init__(self, feature_dim: int, layer_names: list, matching_type=None, use_double_matching=False, node_layer=False):
         super().__init__()
-        self.phattn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, use_submap, 'self') for type in layer_names])
-        self.ghattn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, use_submap, 'self') for type in layer_names])
+        self.phattn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, 'self') for type in layer_names])
+        self.ghattn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, 'self') for type in layer_names])
         if node_layer:
-            attn_list = [AttentionalPropagation(feature_dim, 4, use_submap, type) for type in layer_names]
-            attn_list[-1] = AttentionalPropagation(feature_dim, 4, use_submap, layer_names[-1], node_layer=True)
+            attn_list = [AttentionalPropagation(feature_dim, 4, type) for type in layer_names]
+            attn_list[-1] = AttentionalPropagation(feature_dim, 4, layer_names[-1], node_layer=True)
             self.attn = nn.ModuleList(attn_list)
         elif use_double_matching:
-            self.attn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, use_submap, type, matching_type=matching_type) for type in layer_names])
+            self.attn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, type, matching_type=matching_type) for type in layer_names])
         else:
-            self.attn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, use_submap, type) for type in layer_names])
+            self.attn = nn.ModuleList([AttentionalPropagation(feature_dim, 4, type) for type in layer_names])
         bin_score = torch.nn.Parameter(torch.tensor(1.))
         self.register_parameter('bin_score', bin_score)
         self.names = layer_names
@@ -303,9 +301,9 @@ class Perception_Graph(torch.nn.Module):
         self.node_init = MLP([4] + layers + [feature_dim])
         nn.init.constant_(self.node_init[-1].bias, 0.0)
         self.dis_init = MLP([1, feature_dim, feature_dim])      
-        self.gnn = AttentionalGNN(feature_dim, gnn_layers, self.sub_map, use_double_matching=self.use_double_matching,matching_type=self.matching_type)
+        self.gnn = AttentionalGNN(feature_dim, gnn_layers, use_double_matching=self.use_double_matching,matching_type=self.matching_type)
         if self.use_double_matching:
-            self.node_gnn = AttentionalGNN(feature_dim, node_gnn_layers, self.sub_map, node_layer=True)
+            self.node_gnn = AttentionalGNN(feature_dim, node_gnn_layers, node_layer=True)
         self.use_local_frontier = args.use_local_frontier
         self.cuda = args.cuda
         self.use_double_matching = args.use_double_matching

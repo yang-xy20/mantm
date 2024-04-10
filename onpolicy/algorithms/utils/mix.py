@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from .util import init
-from onpolicy.algorithms.utils.vit import ViT, Attention, PreNorm, Transformer, CrossAttention, FeedForward
+from onpolicy.algorithms.utils.vit import ViT, Attention, PreNorm, CrossAttention, FeedForward
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat
 from .mantm import Perception_Graph
@@ -25,12 +25,9 @@ class MIXBase(nn.Module):
         self._norm_sum = args.norm_sum
         self.hidden_size = args.hidden_size
         self.mlp_hidden_size = args.mlp_hidden_size
-        self.use_vit = args.use_vit
         self.cnn_last_linear = cnn_last_linear
         self.cnn_use_attn = args.cnn_use_attn
-        self.cnn_use_transformer = args.cnn_use_transformer
         self.action_mask = args.action_mask
-       
         self.use_enhanced_id = args.use_enhanced_id
         self.use_one_cnn_model = args.use_one_cnn_model
         self.use_share_cnn_model = args.use_share_cnn_model
@@ -54,7 +51,6 @@ class MIXBase(nn.Module):
         self.embed_keys = []
         self.mlp_keys = []
         self.local_cnn_keys = []
-        self.transformer_keys = []
         self.graph_keys = []
         self.n_cnn_input = 0
         self.n_embed_input = 0
@@ -105,39 +101,17 @@ class MIXBase(nn.Module):
                 raise NotImplementedError
 
         if len(self.cnn_keys) > 0:
-            if self.use_vit:
-                if self.use_one_cnn_model:
-                        self.cnn = self._build_vit_model(obs_shape, self.cnn_keys, self.hidden_size, self._use_orthogonal, self._activation_id)
-                else:
-                    if self.use_share_cnn_model:
-                        self.cnn = self._build_vit_model(obs_shape, self.cnn_keys, self.hidden_size, self._use_orthogonal, self._activation_id)
-                    else:
-                        for i in range(self.num_agents):
-                            setattr(self, 'cnn_' + str(i), self._build_vit_model(obs_shape, self.cnn_keys, self.hidden_size, self._use_orthogonal, self._activation_id))
+            if self.use_map_critic:
+                self.cnn = self._build_graph_critic_cnn_model(self._use_orthogonal, self._activation_id)
+            if self.use_one_cnn_model:
+                self.cnn = self._build_cnn_model(obs_shape, self.cnn_keys, cnn_layers_params, self.hidden_size, self._use_orthogonal, self._activation_id)
             else:
-                if self.use_enhanced_id:
-                    self.cnn_0 = self._build_first_cnn_model(obs_shape, self.cnn_keys, self.hidden_size, self._use_orthogonal, self._activation_id, cnn_layers_params = [(32,3,1,1)])
-                    self.cnn_1 = self._build_middle_cnn_model(self.hidden_size, self._use_orthogonal, self._activation_id, cnn_layers_params = [(64,3,1,1)])
-                    self.cnn_2 = self._build_middle_cnn_model(self.hidden_size, self._use_orthogonal, self._activation_id, cnn_layers_params = [(128,3,1,1)])
-                    self.cnn_3 = self._build_middle_cnn_model(self.hidden_size, self._use_orthogonal, self._activation_id, cnn_layers_params = [(64,3,1,1)])
-                    self.cnn_4 = self._build_middle_cnn_model(self.hidden_size, self._use_orthogonal, self._activation_id, cnn_layers_params = [(32,3,2,1)], use_maxpool2d=False)
+                if self.use_share_cnn_model:
+                    self.cnn = self._build_cnn_model(obs_shape, self.cnn_keys, cnn_layers_params, self.hidden_size, self._use_orthogonal, self._activation_id)
                 else:
-                    if self.use_map_critic:
-                        self.cnn = self._build_graph_critic_cnn_model(self._use_orthogonal, self._activation_id)
-                    if self.use_one_cnn_model:
-                        self.cnn = self._build_cnn_model(obs_shape, self.cnn_keys, cnn_layers_params, self.hidden_size, self._use_orthogonal, self._activation_id)
-                    else:
-                        if self.use_share_cnn_model:
-                            self.cnn = self._build_cnn_model(obs_shape, self.cnn_keys, cnn_layers_params, self.hidden_size, self._use_orthogonal, self._activation_id)
-                        else:
-                            for i in range(self.num_agents):
-                                setattr(self, 'cnn_' + str(i), self._build_cnn_model(obs_shape, self.cnn_keys, cnn_layers_params, self.hidden_size, self._use_orthogonal, self._activation_id))
+                    for i in range(self.num_agents):
+                        setattr(self, 'cnn_' + str(i), self._build_cnn_model(obs_shape, self.cnn_keys, cnn_layers_params, self.hidden_size, self._use_orthogonal, self._activation_id))
 
-       
-
-        if len(self.transformer_keys) >0:
-            self.transformer = self._build_transformer_model(self._use_orthogonal, self._activation_id)
-        
         if len(self.local_cnn_keys) > 0:
             self.local_cnn = self._build_cnn_model(obs_shape, self.local_cnn_keys, cnn_layers_params, self.hidden_size, self._use_orthogonal, self._activation_id, True)
         
@@ -184,25 +158,13 @@ class MIXBase(nn.Module):
                             exec('cnn_x.append(self.cnn_{}(cnn_input[:, 0+self.split_channel*i:self.split_channel+self.split_channel*i]))'.format(i))
                         out_x = torch.cat(cnn_x, dim=1)
    
-        if len(self.transformer_keys)>0:    
-            transformer_input = self._build_transformer_input(x, self.transformer_keys)    
-            trans_x = self.transformer(transformer_input)
-            trans_shape = trans_x.shape
-            trans_x = trans_x.permute(0,2,1).reshape(trans_shape[0], trans_shape[2], self.grid_size, self.grid_size)
-            
-            out_x = torch.cat([out_x, trans_x], dim=1)
-        
-        if self.grid_agent_id:
-            out_x = torch.cat([out_x, x['grid_agent_id']], dim=1) 
+       
         
         if self.action_mask:
             out_x = torch.cat([out_x, x['action_mask_obs']], dim=1) 
         if not self.use_map_critic:
             out_x = self.descon(out_x)
-        if (not self.cnn_last_linear) and self.use_grid_pos_attn:
-            out_x  = torch.cat([out_x, actor_trans_x], dim=1) 
-            out_x = self.descon_again(out_x)
-            
+       
         if len(self.local_cnn_keys) > 0:
             local_cnn_input = self._build_cnn_input(x, self.local_cnn_keys)
             local_cnn_x = self.local_cnn(local_cnn_input)            
@@ -297,15 +259,6 @@ class MIXBase(nn.Module):
                     Attention(self.prev_out_channels, heads=4, dim_head=32, dropout=0.0),
                     Rearrange('b (h w) c -> b c h w', c = self.prev_out_channels, h = cnn_dims[0], w = cnn_dims[1])
                 ]
-            if self.cnn_use_transformer:
-                print("cnn use transformer")
-                cnn_layers += [
-                    Rearrange('b c h w -> b (h w) c', c = self.prev_out_channels, h = cnn_dims[0], w = cnn_dims[1]),
-                    nn.Linear(self.prev_out_channels, 128),
-                    Transformer(dim=128, depth=2, heads=4, dim_head=32, mlp_dim=256),
-                    PreNorm(128, nn.Linear(128,self.prev_out_channels)),
-                    Rearrange('b (h w) c -> b c h w', c = self.prev_out_channels, h = cnn_dims[0], w = cnn_dims[1])
-                ]
 
             if self.cnn_last_linear:
                 cnn_layers += [
@@ -317,12 +270,8 @@ class MIXBase(nn.Module):
                 ]
                 self.cnn_output_dim = hidden_size
             else:
-                if self.use_grid_simple:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = self.prev_out_channels, out_channels = 2, kernel_size = 1, stride = 1, padding = 0))]
-                    self.cnn_output_dim = 2 * cnn_dims[0] * cnn_dims[1]
-                else:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = self.prev_out_channels, out_channels = 3, kernel_size = 1, stride = 1, padding = 0))]
-                    self.cnn_output_dim = 3 * cnn_dims[0] * cnn_dims[1]
+                cnn_layers += [init_(nn.Conv2d(in_channels = self.prev_out_channels, out_channels = 3, kernel_size = 1, stride = 1, padding = 0))]
+                self.cnn_output_dim = 3 * cnn_dims[0] * cnn_dims[1]
             
         self.cnn_dims = cnn_dims
 
@@ -459,109 +408,28 @@ class MIXBase(nn.Module):
         if not (self.use_one_cnn_model ):
             self.prev_out_channels = self.prev_out_channels * self.num_agents
         
-        grid_c = 0
-
-        if self.grid_pos or self.grid_last_goal:
-            grid_c += 16
-        if self.grid_agent_id:
-            grid_c += 1
-        if self.action_mask:
-            grid_c += 1
-
-        if grid_c != 0:  
-            cnn_layers += [init_(nn.Conv2d(in_channels = self.prev_out_channels + grid_c, out_channels = 16, kernel_size = 1, stride = 1, padding = 0)), active_func]
-        
+       
         if self.cnn_use_attn:
             print("descon use attention")
-            channels = 16 if grid_c!=0 else self.prev_out_channels
+            channels =  self.prev_out_channels
             cnn_layers += [
                 Rearrange('b c h w -> b (h w) c', c = channels, h = self.cnn_dims[0], w = self.cnn_dims[1]),
                 Attention(channels, heads=4, dim_head=32, dropout=0.0),
                 Rearrange('b (h w) c -> b c h w', c = channels, h = self.cnn_dims[0], w = self.cnn_dims[1])
             ]
-        if self.cnn_use_transformer:
-            print("descon use transformer")
-            channels = 16 if grid_c!=0 else self.prev_out_channels
-            cnn_layers += [
-                Rearrange('b c h w -> b (h w) c', c = channels, h = self.cnn_dims[0], w = self.cnn_dims[1]),
-                nn.Linear(channels, 128),
-                Transformer(dim=128, depth=2, heads=4, dim_head=32, mlp_dim=256),
-                PreNorm(128, nn.Linear(128,channels)),
-                Rearrange('b (h w) c -> b c h w', c = channels, h = self.cnn_dims[0], w = self.cnn_dims[1])
-            ]
 
         if self.cnn_last_linear:
-            if grid_c!=0:
-                cnn_layers += [
-                    Flatten(),
-                    nn.Linear(16 * self.cnn_dims[0] * self.cnn_dims[1], 
-                                    hidden_size),
-                    active_func,
-                    nn.LayerNorm(hidden_size),
-                ]
-            else:
-                cnn_layers += [
-                    Flatten(),
-                    nn.Linear(self.prev_out_channels * self.cnn_dims[0] * self.cnn_dims[1], 
-                                    hidden_size),
-                    active_func,
-                    nn.LayerNorm(hidden_size),
-                ]
-            
-        else:
-            if grid_c!=0: 
-                if self.use_grid_simple:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = 16, out_channels = 2, kernel_size = 1, stride = 1, padding = 0))]
-                    
-                elif self.grid_goal_simpler:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = 16, out_channels = 1, kernel_size = 1, stride = 1, padding = 0))]
-                    
-                else:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = 16, out_channels = 3, kernel_size = 1, stride = 1, padding = 0))]
-            else:
-                if self.use_grid_simple:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = self.prev_out_channels, out_channels = 2, kernel_size = 1, stride = 1, padding = 0))]
-                elif self.grid_goal_simpler:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = self.prev_out_channels, out_channels = 1, kernel_size = 1, stride = 1, padding = 0))]                
-                else:
-                    cnn_layers += [init_(nn.Conv2d(in_channels = self.prev_out_channels, out_channels = 3, kernel_size = 1, stride = 1, padding = 0))]
+            cnn_layers += [
+                Flatten(),
+                nn.Linear(self.prev_out_channels * self.cnn_dims[0] * self.cnn_dims[1], 
+                                hidden_size),
+                active_func,
+                nn.LayerNorm(hidden_size),
+            ]
                 
         return nn.Sequential(*cnn_layers)
 
-    def _build_vit_model(self, obs_shape, cnn_keys, hidden_size, use_orthogonal, activation_id):
-        print("use vit")
-        active_func = [nn.Tanh(), nn.ReLU(), nn.LeakyReLU(), nn.ELU()][activation_id]
-        init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][use_orthogonal]
-        gain = nn.init.calculate_gain(['tanh', 'relu', 'leaky_relu', 'leaky_relu'][activation_id])
-
-        def init_(m):
-            return init(m, init_method, lambda x: nn.init.constant_(x, 0), gain=gain)
-        
-        n_cnn_input = 0
-        for key in cnn_keys:
-            if key in ['rgb','depth','image','occupy_image']:
-                n_cnn_input += obs_shape[key].shape[2] 
-                cnn_dims = np.array(obs_shape[key].shape[:2], dtype=np.float32)
-            elif key in ['stack_obs']:
-                if self.use_one_cnn_model:
-                    n_cnn_input += obs_shape[key].shape[0]
-                else:
-                    n_cnn_input += int(obs_shape[key].shape[0] // self.num_agents)
-                    self.split_channel = int(obs_shape[key].shape[0] // self.num_agents)
-                cnn_dims = np.array(obs_shape[key].shape[1:3], dtype=np.float32)
-            else:
-                pass
-            
-        vit = ViT(image_size = (int(cnn_dims[0]), int(cnn_dims[1])), patch_size = 16, num_classes = hidden_size, dim = 128, depth = 4, heads = 8, mlp_dim = 256, channels = n_cnn_input)
-
-        models = [vit, init_(nn.Conv2d(in_channels=128,out_channels=32,kernel_size=3,stride=2,padding=1,)), 
-                  active_func]
-        
-        self.cnn_dims = (int(self.grid_size), int(self.grid_size))
-        self.prev_out_channels = 32
-     
-
-        return nn.Sequential(*models)
+  
     
     def _build_embed_model(self, obs_shape):
         self.embed_dim = 0
@@ -572,23 +440,6 @@ class MIXBase(nn.Module):
 
         return nn.Embedding(self.n_embed_input, self.n_embed_output)
     
-    def _build_transformer_model(self, use_orthogonal, activation_id,):
-        active_func = [nn.Tanh(), nn.ReLU(), nn.LeakyReLU(), nn.ELU()][activation_id]
-        init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][use_orthogonal]
-        gain = nn.init.calculate_gain(['tanh', 'relu', 'leaky_relu', 'leaky_relu'][activation_id])
-
-        def init_(m):
-            return init(m, init_method, lambda x: nn.init.constant_(x, 0), gain=gain)
-
-
-        channels = 0
-        
-        cnn_layers = [init_(nn.Linear(channels,16)),
-                    active_func,
-                    nn.LayerNorm(16)
-                ]
-        return nn.Sequential(*cnn_layers)
-
     def _build_graph_model(self, observation_space, action_space, args, rnn_type="LSTM", backbone='resnet18', \
         resnet_baseplanes=32, normalize_visual_inputs=True):
         return Perception_Graph(args, self.graph_linear)
@@ -652,16 +503,6 @@ class MIXBase(nn.Module):
         cnn_input = torch.cat(cnn_input, dim=1)
         return cnn_input
     
-    def _build_transformer_input(self, obs, transformer_keys):
-        transformer_input = []
-        for key in transformer_keys: 
-            if key in ['grid_pos','grid_goal']:
-                x = obs[key].shape
-                transformer_input.append(obs[key].view(x[0],x[1],-1).permute(0,2,1))    
-            else:
-                raise NotImplementedError
-        transformer_input = torch.cat(transformer_input, dim=2)
-        return transformer_input
 
 
     def _build_embed_input(self, obs):

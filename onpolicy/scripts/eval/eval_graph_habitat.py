@@ -490,12 +490,8 @@ def main(args):
         from onpolicy.runner.separated.habitat_runner import HabitatRunner as Runner
 
     runner = Runner(config)
-    if all_args.use_async:
-        runner.eval_async()
-    elif all_args.use_noisy_render:
-        runner.eval_noisy()
-    else:
-        runner.eval()
+    
+    runner.eval()
     
     # post process
     envs.close()

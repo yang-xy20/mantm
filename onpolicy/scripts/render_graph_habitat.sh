@@ -10,7 +10,7 @@ echo "env is ${env}, scenario is ${scenario}, algo is ${algo}, exp is ${exp}, ma
 for seed in `seq ${seed_max}`;
 do
     echo "seed is ${seed}:"
-    CUDA_VISIBLE_DEVICES=6,7 python eval/eval_graph_habitat.py --scenario_name ${scenario} --env_name ${env} --algorithm_name ${algo} \
+    CUDA_VISIBLE_DEVICES=0,1 python eval/eval_graph_habitat.py --scenario_name ${scenario} --env_name ${env} --algorithm_name ${algo} \
     --experiment_name ${exp} --num_agents ${num_agents} --split "train" --use_same_scene --scene_id 20 --eval_episodes 100 --use_eval \
     --ifi 0.01 --seed 1 --n_training_threads 1 --n_rollout_threads 1 --num_mini_batch 5 --max_episode_length 300 --num_local_steps 15 \
     --num_env_steps 20000000 --ppo_epoch 4 --gain 0.01 --lr 2.5e-5 --critic_lr 2.5e-5 --use_maxpool2d \

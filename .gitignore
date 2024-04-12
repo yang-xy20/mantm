@@ -26,8 +26,10 @@ png
 
 gibson/assets/dataset
 docker
-dataset
-data
+# dataset
+# data/
+/onpolicy/envs/habitat/data/datasets
+/onpolicy/envs/habitat/data/scene_datasets
 pretrained_models
 
 onpolicy/envs/vizdoom/
